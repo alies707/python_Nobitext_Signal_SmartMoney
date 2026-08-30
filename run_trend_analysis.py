@@ -1,13 +1,9 @@
 """Live Nobitex market-data analyzer for Strategy V2.
 
-Fetches real OHLCV data from Nobitex and prints the complete analysis path in
-plain terminal output. This script does not place orders and does not fabricate
-missing data.
-
-Examples:
-    python run_trend_analysis.py --symbol BTCIRT
-    python run_trend_analysis.py --symbol BTCIRT --timeframe 15m --limit 800
-    python run_trend_analysis.py --symbol BTCIRT --timeframe 1H
+Fetches real OHLCV data from Nobitex and prints an auditable decision path.
+This script never places orders. It does not treat a data-quality warning as
+an execution failure, but it clearly reports the warning so research/backtest
+code can decide whether the dataset is acceptable.
 """
 from __future__ import annotations
 
@@ -20,9 +16,7 @@ from data.historical_data import HistoricalData
 from exchange.nobitex_client import NobitexClient, to_udf_symbol
 from models.candle import Candle
 from strategy.trend_momentum_pullback import (
-    Direction,
     StrategyConfig,
-    StrategyState,
     TrendMomentumPullbackStrategy,
     _atr,
     _ema,
@@ -40,6 +34,28 @@ def fmt_ts(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def expected_interval_ms(label: str) -> int | None:
+    return {
+        "5m": 5 * 60 * 1000,
+        "15m": 15 * 60 * 1000,
+        "1H": 60 * 60 * 1000,
+        "4H": 4 * 60 * 60 * 1000,
+        "1D": 24 * 60 * 60 * 1000,
+    }.get(label)
+
+
+def gap_details(label: str, candles: Sequence[Candle]) -> list[tuple[int, int, int]]:
+    expected = expected_interval_ms(label)
+    if expected is None:
+        return []
+    gaps: list[tuple[int, int, int]] = []
+    for previous, current in zip(candles, candles[1:]):
+        delta = current.timestamp - previous.timestamp
+        if delta != expected:
+            gaps.append((previous.timestamp, current.timestamp, delta))
+    return gaps
+
+
 def print_candle_summary(label: str, candles: Sequence[Candle]) -> None:
     print(f"\n[{label} DATA]")
     print(f"Candles received : {len(candles)}")
@@ -52,19 +68,16 @@ def print_candle_summary(label: str, candles: Sequence[Candle]) -> None:
     print(f"Last candle      : {fmt_ts(last.timestamp)}")
     print(f"Last close       : {fmt_price(last.close)}")
     print(f"Last volume      : {last.volume:,.4f}")
-    gaps = 0
-    if len(candles) > 1:
-        expected = {
-            "15m": 15 * 60 * 1000,
-            "1H": 60 * 60 * 1000,
-            "4H": 4 * 60 * 60 * 1000,
-            "1D": 24 * 60 * 60 * 1000,
-        }.get(label)
-        if expected:
-            gaps = sum(
-                1 for a, b in zip(candles, candles[1:]) if b.timestamp - a.timestamp != expected
-            )
-    print(f"Timestamp gaps   : {gaps}")
+    gaps = gap_details(label, candles)
+    print(f"Timestamp gaps   : {len(gaps)}")
+    if gaps:
+        previous_ts, current_ts, delta = gaps[0]
+        expected = expected_interval_ms(label)
+        print(
+            "First gap        : "
+            f"{fmt_ts(previous_ts)} -> {fmt_ts(current_ts)} "
+            f"({delta / 60000:.1f} min; expected {expected / 60000:.1f} min)"
+        )
 
 
 def print_indicator_summary(entry: Sequence[Candle], htf4h: Sequence[Candle], htf1d: Sequence[Candle], config: StrategyConfig) -> None:
@@ -72,7 +85,6 @@ def print_indicator_summary(entry: Sequence[Candle], htf4h: Sequence[Candle], ht
     if not entry:
         print("Entry timeframe  : NO DATA")
         return
-
     closes = [c.close for c in entry]
     ema20 = _ema(closes, config.execution_ema)
     atr = _atr(entry, config.atr_period)
@@ -86,14 +98,48 @@ def print_indicator_summary(entry: Sequence[Candle], htf4h: Sequence[Candle], ht
     print(f"HTF 1D regime    : {_htf_regime(htf1d, config)}")
 
 
+def print_diagnostics(diagnostics: dict) -> None:
+    print("\n[DECISION GATES]")
+    print(f"Data ready       : {'PASS' if diagnostics['data'] else 'FAIL'}")
+    print(f"HTF data ready   : {'PASS' if diagnostics['htf_data'] else 'FAIL'}")
+    print(
+        f"HTF regime       : {diagnostics['htf_regime']} "
+        f"({'PASS' if diagnostics['htf_regime_ok'] else 'FAIL'})"
+    )
+    atr_pct = diagnostics.get("atr_pct")
+    atr_text = "N/A" if atr_pct is None else f"{atr_pct * 100:.3f}%"
+    print(
+        f"ATR filter       : {'PASS' if diagnostics['atr_filter'] else 'FAIL'} "
+        f"({atr_text})"
+    )
+    print(f"Breakout         : {'PASS' if diagnostics['breakout'] else 'FAIL'}")
+
+    breakout = diagnostics.get("breakout_candidate")
+    if breakout is not None:
+        print(f"Breakout dir     : {breakout.direction.value}")
+        print(f"Breakout candle  : {breakout.breakout_index}")
+        print(f"Breakout level   : {fmt_price(breakout.breakout_level)}")
+        print(f"Pullback window  : {'PASS' if diagnostics['pullback_window'] else 'FAIL'}")
+    else:
+        print("Pullback window  : N/A")
+
+    print(
+        f"Pullback confirm : "
+        f"{'PASS' if diagnostics['pullback_confirmation'] else 'FAIL'}"
+    )
+    rr = diagnostics.get("risk_reward")
+    print(f"Risk/Reward      : {'N/A' if rr is None else f'{rr:.2f}R'}")
+    print(f"Final gate       : {'PASS' if diagnostics['final_signal'] else 'FAIL'}")
+    if diagnostics.get("blocking_reason"):
+        print(f"Blocking reason  : {diagnostics['blocking_reason']}")
+
+
 def print_signal(signal) -> None:
     print("\n[STRATEGY V2 RESULT]")
     if signal is None:
         print("State            : NO_VALID_SETUP")
         print("Signal           : NONE")
-        print("Reason           : Current Nobitex data does not satisfy every required condition.")
         return
-
     print(f"State            : {signal.state.value}")
     print(f"Direction        : {signal.direction.value}")
     print(f"Regime           : {signal.regime}")
@@ -150,7 +196,19 @@ def analyze(symbol: str, timeframe: str, limit: int, equity: float | None) -> in
     strategy = TrendMomentumPullbackStrategy(strategy_config)
     print_indicator_summary(entry, htf4h, htf1d, strategy_config)
 
-    print("\n[DECISION]")
+    print("\n[STRATEGY AUDIT]")
+    diagnostics = strategy.diagnose(entry, htf_candles=htf4h)
+    print_diagnostics(diagnostics)
+
+    if htf1d:
+        daily_regime = _htf_regime(htf1d, strategy_config)
+        print(f"1D independent check: {daily_regime}")
+        if daily_regime != diagnostics["htf_regime"]:
+            print("HTF consistency  : WARNING (4H and 1D regimes disagree)")
+        else:
+            print("HTF consistency  : PASS (4H and 1D regimes agree)")
+
+    print("\n[FINAL RESULT]")
     if not entry or not htf4h or not htf1d:
         print("State            : INSUFFICIENT_DATA")
         print("Signal           : NONE")

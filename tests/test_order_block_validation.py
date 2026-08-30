@@ -28,7 +28,7 @@ def test_old_unrelated_opposing_candle_is_not_used_as_ob():
         _c(98.5, 99, 97, 97.5, 2),
         _c(97.5, 98, 96, 96.5, 3),
         _c(96.5, 97, 95, 96, 4),
-        _c(96, 99, 95.8, 98.5, 5),
+        _c(96, 96.8, 95.8, 96.4, 5),  # no close above the candidate OB high
     ]
     ob = detect_order_block(candles, 5, "BULLISH", "15m")
     assert ob is None

@@ -43,10 +43,15 @@ def score_fvg(fvg: FVG, ctx: FvgContext) -> int:
 
 
 def is_mitigated(fvg: FVG, candles: List[Candle], from_index: int) -> bool:
-    """A gap is mitigated when later price trades back into its zone."""
+    """A gap is mitigated when later price trades into its interior zone.
+
+    A touch of the outer boundary alone does not count as mitigation. This is
+    important for live setups where the next candle can open or wick exactly at
+    the FVG edge without actually filling any part of the imbalance.
+    """
     for j in range(max(0, from_index), len(candles)):
         c = candles[j]
-        if c.low <= fvg.upper and c.high >= fvg.lower:
+        if c.low < fvg.upper and c.high > fvg.lower:
             return True
     return False
 

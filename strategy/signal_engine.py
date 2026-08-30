@@ -192,7 +192,7 @@ class SignalEngine:
             return None
         low = max(fvg.lower, ob.zone_low)
         high = min(fvg.upper, ob.zone_high)
-        if high <= low:
+        if high < low:
             return None
         return low, high
 

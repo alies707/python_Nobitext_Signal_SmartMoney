@@ -44,7 +44,7 @@ def test_bearish_order_block_is_last_bullish_candle():
     assert ob.creation_index == 3
 
 
-def test_order_block_invalidated_loses_freshness():
+def test_order_block_invalidated_is_rejected():
     data = [
         _c(0, 100, 101, 99, 100),
         _c(1, 100, 102, 99, 101),
@@ -52,11 +52,10 @@ def test_order_block_invalidated_loses_freshness():
         _c(3, 102, 104, 101, 103),
         _c(4, 103, 104, 95, 96),   # bearish OB at ~95-104
         _c(5, 96, 112, 95, 110),   # bullish displacement
-        _c(6, 110, 113, 90, 92),    # later closes below OB low -> not fresh
+        _c(6, 110, 113, 90, 92),   # later closes below OB low -> invalidated
     ]
-    ob = detect_order_block(data, 5, "BULLISH", timeframe="15m")
-    assert ob is not None
-    assert ob.fresh is False
+    ob = detect_order_block(data, 6, "BULLISH", timeframe="15m")
+    assert ob is None
 
 
 def test_fvg_near_ob_overlap():

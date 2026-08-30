@@ -123,7 +123,6 @@ def test_equity_curve_includes_open_trade_mark_to_market():
                 return None
             close = candles[-1].close
             stop = close - 5.0
-            risk = close - stop
             return TrendPullbackSignal(
                 direction=Direction.LONG,
                 timestamp=candles[-1].timestamp,
@@ -146,6 +145,10 @@ def test_equity_curve_includes_open_trade_mark_to_market():
     candles = _bars([100.0 + i for i in range(20)] + [121.0, 122.0, 123.0, 124.0])
     htf = _bars([100.0 + i for i in range(20)], step_ms=14_400_000)
     result = bt.run(candles, htf, "TEST")
-    assert result.trades
+
+    assert strategy.calls >= 2
+    assert len(result.trades) == 1
+    assert result.trades[0].result == "WIN"
+    assert result.equity_curve
     assert any(value != cfg.initial_capital for _, value in result.equity_curve)
     assert any(value > cfg.initial_capital for _, value in result.equity_curve)

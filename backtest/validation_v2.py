@@ -6,7 +6,7 @@ from statistics import median
 from typing import Sequence
 
 from backtest.performance_v2 import PerformanceV2, compute_performance_v2
-from backtest.trend_pullback import TrendPullbackBacktester
+from backtest.trend_pullback import TrendPullbackBacktester, V2BacktestResult
 from config import Config
 from models.candle import Candle
 from strategy.trend_momentum_pullback import StrategyConfig, TrendMomentumPullbackStrategy
@@ -25,6 +25,8 @@ class ValidationSplit:
 class ValidationFold:
     fold_id: int
     split: ValidationSplit
+    in_sample_result: V2BacktestResult
+    out_of_sample_result: V2BacktestResult
     in_sample_performance: PerformanceV2
     out_of_sample_performance: PerformanceV2
 
@@ -74,14 +76,11 @@ class RobustValidation:
 
     @property
     def oos_initial_equity(self) -> float:
-        return self.folds[0].out_of_sample_performance.initial_capital if self.folds else 0.0
+        return self.folds[0].out_of_sample_result.initial_equity if self.folds else 0.0
 
     @property
     def oos_final_equity(self) -> float:
-        if not self.folds:
-            return 0.0
-        last = self.folds[-1].out_of_sample_performance
-        return last.initial_capital + last.total_pnl
+        return self.folds[-1].out_of_sample_result.final_equity if self.folds else 0.0
 
     @property
     def aggregate_oos_pnl(self) -> float:
@@ -166,12 +165,28 @@ def expanding_walk_forward_splits(entry_candles: Sequence[Candle], htf_candles: 
     return tuple(splits)
 
 
+def _run_split(split: ValidationSplit, config: Config, strategy_cfg: StrategyConfig, initial_equity: float) -> ValidationFold:
+    is_result = TrendPullbackBacktester(TrendMomentumPullbackStrategy(strategy_cfg), config).run(
+        split.in_sample, split.in_sample_htf, "VALIDATION", initial_equity=config.initial_capital
+    )
+    oos_result = TrendPullbackBacktester(TrendMomentumPullbackStrategy(strategy_cfg), config).run(
+        split.out_of_sample, split.out_of_sample_htf, "VALIDATION", initial_equity=initial_equity
+    )
+    return ValidationFold(
+        fold_id=0,
+        split=split,
+        in_sample_result=is_result,
+        out_of_sample_result=oos_result,
+        in_sample_performance=compute_performance_v2(is_result),
+        out_of_sample_performance=compute_performance_v2(oos_result),
+    )
+
+
 def validate_v2(entry_candles: Sequence[Candle], htf_candles: Sequence[Candle], config: Config, strategy_config: StrategyConfig | None = None, oos_fraction: float = 0.30) -> ValidationFold:
     split = time_split(entry_candles, htf_candles, oos_fraction=oos_fraction)
     strategy_cfg = strategy_config or StrategyConfig()
-    is_result = TrendPullbackBacktester(TrendMomentumPullbackStrategy(strategy_cfg), config).run(split.in_sample, split.in_sample_htf, "VALIDATION", initial_equity=config.initial_capital)
-    oos_result = TrendPullbackBacktester(TrendMomentumPullbackStrategy(strategy_cfg), config).run(split.out_of_sample, split.out_of_sample_htf, "VALIDATION", initial_equity=config.initial_capital)
-    return ValidationFold(1, split, compute_performance_v2(is_result), compute_performance_v2(oos_result))
+    fold = _run_split(split, config, strategy_cfg, config.initial_capital)
+    return ValidationFold(1, fold.split, fold.in_sample_result, fold.out_of_sample_result, fold.in_sample_performance, fold.out_of_sample_performance)
 
 
 def robust_validate_v2(entry_candles: Sequence[Candle], htf_candles: Sequence[Candle], config: Config, strategy_config: StrategyConfig | None = None, n_folds: int = 3, oos_fraction: float = 0.20, min_trades_per_fold: int = 20) -> RobustValidation:
@@ -182,8 +197,15 @@ def robust_validate_v2(entry_candles: Sequence[Candle], htf_candles: Sequence[Ca
     folds: list[ValidationFold] = []
     oos_equity = config.initial_capital
     for fold_id, split in enumerate(splits, start=1):
-        is_result = TrendPullbackBacktester(TrendMomentumPullbackStrategy(strategy_cfg), config).run(split.in_sample, split.in_sample_htf, "VALIDATION", initial_equity=config.initial_capital)
-        oos_result = TrendPullbackBacktester(TrendMomentumPullbackStrategy(strategy_cfg), config).run(split.out_of_sample, split.out_of_sample_htf, "VALIDATION", initial_equity=oos_equity)
-        oos_equity = oos_result.final_equity
-        folds.append(ValidationFold(fold_id, split, compute_performance_v2(is_result), compute_performance_v2(oos_result)))
+        fold = _run_split(split, config, strategy_cfg, oos_equity)
+        fold = ValidationFold(
+            fold_id=fold_id,
+            split=fold.split,
+            in_sample_result=fold.in_sample_result,
+            out_of_sample_result=fold.out_of_sample_result,
+            in_sample_performance=fold.in_sample_performance,
+            out_of_sample_performance=fold.out_of_sample_performance,
+        )
+        oos_equity = fold.out_of_sample_result.final_equity
+        folds.append(fold)
     return RobustValidation(tuple(folds), min_trades_per_fold=min_trades_per_fold)

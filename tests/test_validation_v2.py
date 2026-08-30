@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import pytest
 
+from backtest.performance_v2 import PerformanceV2
+from backtest.trend_pullback import V2BacktestResult
+from backtest.validation_v2 import (
+    ValidationFold,
+    expanding_walk_forward_splits,
+    robust_validate_v2,
+    time_split,
+    validate_v2,
+)
 from config import load_config
 from models.candle import Candle
-from backtest.validation_v2 import expanding_walk_forward_splits, robust_validate_v2, time_split, validate_v2
 
 
 def _bars(n: int, step_ms: int, start_ms: int = 1_700_000_000_000) -> list[Candle]:
@@ -21,6 +29,39 @@ def _bars(n: int, step_ms: int, start_ms: int = 1_700_000_000_000) -> list[Candl
             volume=100.0,
         ))
     return out
+
+
+def _performance(total_trades: int, total_pnl: float, profit_factor: float, expectancy_r: float) -> PerformanceV2:
+    return PerformanceV2(
+        total_trades=total_trades,
+        wins=total_trades if total_pnl > 0 else 0,
+        losses=0 if total_pnl > 0 else total_trades,
+        win_rate_pct=100.0 if total_pnl > 0 else 0.0,
+        profit_factor=profit_factor,
+        total_pnl=total_pnl,
+        total_return_pct=total_pnl,
+        average_r=expectancy_r,
+        expectancy_r=expectancy_r,
+        max_drawdown_pct=0.0,
+        max_consecutive_losses=0,
+        max_consecutive_wins=total_trades if total_pnl > 0 else 0,
+        long=__import__("backtest.performance_v2", fromlist=["SidePerformance"]).SidePerformance(),
+        short=__import__("backtest.performance_v2", fromlist=["SidePerformance"]).SidePerformance(),
+    )
+
+
+def _fold_with_performance(p: PerformanceV2, minimum_trades: int = 20) -> ValidationFold:
+    candles = tuple(_bars(30, 3_600_000))
+    split = time_split(candles, tuple(_bars(10, 14_400_000)), oos_fraction=0.20)
+    result = V2BacktestResult(initial_equity=100.0, final_equity=100.0 + p.total_pnl)
+    return ValidationFold(
+        fold_id=1,
+        split=split,
+        in_sample_result=result,
+        out_of_sample_result=result,
+        in_sample_performance=p,
+        out_of_sample_performance=p,
+    )
 
 
 def test_time_split_entry_data_is_strictly_disjoint():
@@ -162,6 +203,26 @@ def test_performance_status_requires_sufficient_sample_before_failure():
             assert status == "INCONCLUSIVE"
         else:
             assert status in {"PASS", "FAIL"}
+
+
+def test_sampled_losing_fold_is_performance_failure_not_inconclusive():
+    losing = _performance(total_trades=20, total_pnl=-10.0, profit_factor=0.8, expectancy_r=-0.5)
+    fold = _fold_with_performance(losing, minimum_trades=20)
+    assert fold.sample_status(20) == "PASS"
+    assert fold.performance_status(20) == "FAIL"
+    assert fold.performance_failure_reasons(20) == (
+        "OOS PnL <= 0",
+        "OOS profit factor <= 1.0",
+        "OOS expectancy <= 0R",
+    )
+
+
+def test_insufficient_sample_remains_inconclusive_even_when_losing():
+    losing = _performance(total_trades=17, total_pnl=-10.0, profit_factor=0.8, expectancy_r=-0.5)
+    fold = _fold_with_performance(losing, minimum_trades=20)
+    assert fold.sample_status(20) == "INCONCLUSIVE"
+    assert fold.performance_status(20) == "INCONCLUSIVE"
+    assert fold.performance_failure_reasons(20) == ()
 
 
 def test_future_entry_changes_cannot_affect_earlier_oos_fold():

@@ -1,4 +1,3 @@
-"""Robust time-series validation for Trend/Momentum/Pullback Strategy V2."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -38,6 +37,16 @@ class ValidationFold:
             return 0.0
         return oos_pf / is_pf * 100.0
 
+    def sample_status(self, minimum_trades: int) -> str:
+        return "PASS" if self.out_of_sample_performance.total_trades >= minimum_trades else "INCONCLUSIVE"
+
+    def performance_status(self, minimum_trades: int) -> str:
+        if self.out_of_sample_performance.total_trades < minimum_trades:
+            return "INCONCLUSIVE"
+        if self.out_of_sample_performance.total_pnl > 0 and self.out_of_sample_performance.profit_factor > 1.0:
+            return "PASS"
+        return "FAIL"
+
 
 @dataclass(frozen=True)
 class RobustValidation:
@@ -62,6 +71,21 @@ class RobustValidation:
             f.out_of_sample_performance.total_trades >= self.min_trades_per_fold
             for f in self.folds
         )
+
+    @property
+    def performance_failures(self) -> int:
+        return sum(
+            f.out_of_sample_performance.total_trades >= self.min_trades_per_fold
+            and not (
+                f.out_of_sample_performance.total_pnl > 0
+                and f.out_of_sample_performance.profit_factor > 1.0
+            )
+            for f in self.folds
+        )
+
+    @property
+    def inconclusive_folds(self) -> int:
+        return len(self.folds) - self.folds_with_sufficient_sample
 
     @property
     def median_oos_profit_factor(self) -> float:
@@ -101,7 +125,7 @@ class RobustValidation:
             len(self.folds) >= 3
             and self.total_oos_trades >= self.min_trades_per_fold * len(self.folds)
             and self.folds_with_sufficient_sample == len(self.folds)
-            and self.positive_oos_folds == len(self.folds)
+            and self.performance_failures == 0
             and self.aggregate_oos_pnl > 0
             and self.median_oos_profit_factor > 1.05
             and self.median_pf_retention_pct >= 50.0
@@ -117,7 +141,11 @@ def _validate_series(entry_candles: Sequence[Candle], htf_candles: Sequence[Cand
         raise ValueError("HTF candles must be strictly increasing")
 
 
-def time_split(entry_candles: Sequence[Candle], htf_candles: Sequence[Candle], oos_fraction: float = 0.30) -> ValidationSplit:
+def time_split(
+    entry_candles: Sequence[Candle],
+    htf_candles: Sequence[Candle],
+    oos_fraction: float = 0.30,
+) -> ValidationSplit:
     if not 0.10 <= oos_fraction <= 0.50:
         raise ValueError("oos_fraction must be between 0.10 and 0.50")
     _validate_series(entry_candles, htf_candles)
@@ -134,7 +162,12 @@ def time_split(entry_candles: Sequence[Candle], htf_candles: Sequence[Candle], o
     return ValidationSplit(cutoff, is_entry, oos_entry, is_htf, oos_htf)
 
 
-def expanding_walk_forward_splits(entry_candles: Sequence[Candle], htf_candles: Sequence[Candle], n_folds: int = 3, oos_fraction: float = 0.20) -> tuple[ValidationSplit, ...]:
+def expanding_walk_forward_splits(
+    entry_candles: Sequence[Candle],
+    htf_candles: Sequence[Candle],
+    n_folds: int = 3,
+    oos_fraction: float = 0.20,
+) -> tuple[ValidationSplit, ...]:
     if n_folds < 2:
         raise ValueError("n_folds must be at least 2")
     if not 0.10 <= oos_fraction <= 0.30:
@@ -165,12 +198,23 @@ def expanding_walk_forward_splits(entry_candles: Sequence[Candle], htf_candles: 
     return tuple(splits)
 
 
-def _run_split(split: ValidationSplit, config: Config, strategy_cfg: StrategyConfig, initial_equity: float) -> ValidationFold:
+def _run_split(
+    split: ValidationSplit,
+    config: Config,
+    strategy_cfg: StrategyConfig,
+    initial_equity: float,
+) -> ValidationFold:
     is_result = TrendPullbackBacktester(TrendMomentumPullbackStrategy(strategy_cfg), config).run(
-        split.in_sample, split.in_sample_htf, "VALIDATION", initial_equity=config.initial_capital
+        split.in_sample,
+        split.in_sample_htf,
+        "VALIDATION",
+        initial_equity=config.initial_capital,
     )
     oos_result = TrendPullbackBacktester(TrendMomentumPullbackStrategy(strategy_cfg), config).run(
-        split.out_of_sample, split.out_of_sample_htf, "VALIDATION", initial_equity=initial_equity
+        split.out_of_sample,
+        split.out_of_sample_htf,
+        "VALIDATION",
+        initial_equity=initial_equity,
     )
     return ValidationFold(
         fold_id=0,
@@ -182,14 +226,35 @@ def _run_split(split: ValidationSplit, config: Config, strategy_cfg: StrategyCon
     )
 
 
-def validate_v2(entry_candles: Sequence[Candle], htf_candles: Sequence[Candle], config: Config, strategy_config: StrategyConfig | None = None, oos_fraction: float = 0.30) -> ValidationFold:
+def validate_v2(
+    entry_candles: Sequence[Candle],
+    htf_candles: Sequence[Candle],
+    config: Config,
+    strategy_config: StrategyConfig | None = None,
+    oos_fraction: float = 0.30,
+) -> ValidationFold:
     split = time_split(entry_candles, htf_candles, oos_fraction=oos_fraction)
     strategy_cfg = strategy_config or StrategyConfig()
     fold = _run_split(split, config, strategy_cfg, config.initial_capital)
-    return ValidationFold(1, fold.split, fold.in_sample_result, fold.out_of_sample_result, fold.in_sample_performance, fold.out_of_sample_performance)
+    return ValidationFold(
+        1,
+        fold.split,
+        fold.in_sample_result,
+        fold.out_of_sample_result,
+        fold.in_sample_performance,
+        fold.out_of_sample_performance,
+    )
 
 
-def robust_validate_v2(entry_candles: Sequence[Candle], htf_candles: Sequence[Candle], config: Config, strategy_config: StrategyConfig | None = None, n_folds: int = 3, oos_fraction: float = 0.20, min_trades_per_fold: int = 20) -> RobustValidation:
+def robust_validate_v2(
+    entry_candles: Sequence[Candle],
+    htf_candles: Sequence[Candle],
+    config: Config,
+    strategy_config: StrategyConfig | None = None,
+    n_folds: int = 3,
+    oos_fraction: float = 0.20,
+    min_trades_per_fold: int = 20,
+) -> RobustValidation:
     if min_trades_per_fold < 1:
         raise ValueError("min_trades_per_fold must be positive")
     splits = expanding_walk_forward_splits(entry_candles, htf_candles, n_folds, oos_fraction)

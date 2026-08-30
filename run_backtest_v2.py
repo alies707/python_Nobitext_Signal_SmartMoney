@@ -7,52 +7,12 @@ from config import load_config
 from data.historical_data import HistoricalData
 from exchange.nobitex_client import NobitexClient, to_udf_symbol
 from backtest.trend_pullback import TrendPullbackBacktester
+from backtest.performance_v2 import compute_performance_v2
 from strategy.trend_momentum_pullback import StrategyConfig, TrendMomentumPullbackStrategy
 
 
 def ts(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-def _performance(trades, initial_equity: float) -> dict:
-    if not trades:
-        return {
-            "win_rate": 0.0,
-            "profit_factor": 0.0,
-            "average_r": 0.0,
-            "total_pnl": 0.0,
-            "return_pct": 0.0,
-            "max_drawdown_pct": 0.0,
-            "long_trades": 0,
-            "short_trades": 0,
-        }
-
-    wins = [t for t in trades if t.result == "WIN"]
-    losses = [t for t in trades if t.result == "LOSS"]
-    gross_profit = sum(t.realized_pnl for t in wins)
-    gross_loss = abs(sum(t.realized_pnl for t in losses))
-    total_pnl = sum(t.realized_pnl for t in trades)
-
-    equity = initial_equity
-    peak = initial_equity
-    max_dd = 0.0
-    for trade in trades:
-        equity += trade.realized_pnl
-        peak = max(peak, equity)
-        if peak > 0:
-            max_dd = max(max_dd, (peak - equity) / peak * 100.0)
-
-    r_values = [t.r_multiple for t in trades]
-    return {
-        "win_rate": len(wins) / len(trades) * 100.0,
-        "profit_factor": gross_profit / gross_loss if gross_loss > 0 else float("inf"),
-        "average_r": sum(r_values) / len(r_values) if r_values else 0.0,
-        "total_pnl": total_pnl,
-        "return_pct": total_pnl / initial_equity * 100.0 if initial_equity > 0 else 0.0,
-        "max_drawdown_pct": max_dd,
-        "long_trades": sum(1 for t in trades if t.direction.value == "LONG"),
-        "short_trades": sum(1 for t in trades if t.direction.value == "SHORT"),
-    }
 
 
 def main() -> int:
@@ -79,14 +39,11 @@ def main() -> int:
         print(f"ERROR: insufficient data entry={len(entry)} 4H={len(htf)}")
         return 3
 
-    strategy_cfg = StrategyConfig()
-    strategy = TrendMomentumPullbackStrategy(strategy_cfg)
-    bt = TrendPullbackBacktester(strategy, cfg)
-    result = bt.run(entry, htf, to_udf_symbol(args.symbol), initial_equity=args.equity)
-
-    perf = _performance(result.trades, result.initial_equity)
-    wins = sum(1 for t in result.trades if t.result == "WIN")
-    losses = sum(1 for t in result.trades if t.result == "LOSS")
+    strategy = TrendMomentumPullbackStrategy(StrategyConfig())
+    result = TrendPullbackBacktester(strategy, cfg).run(
+        entry, htf, to_udf_symbol(args.symbol), initial_equity=args.equity
+    )
+    perf = compute_performance_v2(result)
     coverage_days = ((entry[-1].timestamp - entry[0].timestamp) / 86_400_000) if len(entry) >= 2 else 0.0
 
     print("=" * 72)
@@ -100,17 +57,21 @@ def main() -> int:
     print(f"Coverage           : {coverage_days:.2f} days")
     print(f"Initial equity     : {result.initial_equity:,.2f}")
     print(f"Final equity       : {result.final_equity:,.2f}")
-    print(f"Total PnL          : {perf['total_pnl']:+,.2f}")
-    print(f"Total return       : {perf['return_pct']:+.3f}%")
-    print(f"Trades             : {len(result.trades)}")
-    print(f"Wins               : {wins}")
-    print(f"Losses             : {losses}")
-    print(f"Win rate           : {perf['win_rate']:.2f}%")
-    print(f"Profit factor      : {perf['profit_factor']:.3f}")
-    print(f"Average R          : {perf['average_r']:+.3f}R")
-    print(f"Max drawdown       : {perf['max_drawdown_pct']:.3f}%")
-    print(f"LONG / SHORT       : {perf['long_trades']} / {perf['short_trades']}")
-    print(f"Sample assessment  : {'SUFFICIENT FOR PRELIMINARY TEST' if len(result.trades) >= 30 and coverage_days >= 90 else 'INSUFFICIENT FOR STRATEGY VALIDATION'}")
+    print(f"Total PnL          : {perf.total_pnl:+,.2f}")
+    print(f"Total return       : {perf.total_return_pct:+.3f}%")
+    print(f"Trades             : {perf.total_trades}")
+    print(f"Wins               : {perf.wins}")
+    print(f"Losses             : {perf.losses}")
+    print(f"Win rate           : {perf.win_rate_pct:.2f}%")
+    print(f"Profit factor      : {perf.profit_factor:.3f}")
+    print(f"Average R          : {perf.average_r:+.3f}R")
+    print(f"Expectancy         : {perf.expectancy_r:+.3f}R")
+    print(f"Max drawdown       : {perf.max_drawdown_pct:.3f}%")
+    print(f"Max loss streak    : {perf.max_consecutive_losses}")
+    print(f"Max win streak     : {perf.max_consecutive_wins}")
+    print(f"LONG                : {perf.long.trades} trades | {perf.long.win_rate_pct:.2f}% win | PF {perf.long.profit_factor:.3f} | PnL {perf.long.total_pnl:+,.2f}")
+    print(f"SHORT               : {perf.short.trades} trades | {perf.short.win_rate_pct:.2f}% win | PF {perf.short.profit_factor:.3f} | PnL {perf.short.total_pnl:+,.2f}")
+    print(f"Sample assessment  : {'SUFFICIENT FOR PRELIMINARY TEST' if perf.total_trades >= 30 and coverage_days >= 90 else 'INSUFFICIENT FOR STRATEGY VALIDATION'}")
     print("Execution model    : next-bar open + slippage; stop wins ambiguous bar")
     print("Look-ahead         : BLOCKED; completed HTF candles only")
     print("=" * 72)

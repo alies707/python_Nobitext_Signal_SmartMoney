@@ -58,13 +58,12 @@ def find_relevant_fvg(
     ctx: FvgContext,
     window: int = 6,
     timeframe: str = "",
-    require_score: bool = True,
+    require_score: bool = False,
 ) -> Optional[FVG]:
     """Find the best unmitigated FVG in the setup direction.
 
-    ``require_score=False`` is used by the signal engine when OB confluence is
-    not known until after the candidate FVG is selected. The candidate is then
-    rescored with the actual FVG/OB relationship.
+    By default selection happens before final OB confluence is known. Callers
+    that already have a complete context can set ``require_score=True``.
     """
     best: Optional[FVG] = None
     start = max(2, mss_index)

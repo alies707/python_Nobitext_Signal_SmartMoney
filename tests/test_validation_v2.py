@@ -23,15 +23,22 @@ def _bars(n: int, step_ms: int, start_ms: int = 1_700_000_000_000) -> list[Candl
     return out
 
 
-def test_time_split_is_strictly_disjoint():
+def test_time_split_entry_data_is_strictly_disjoint():
     entry = _bars(100, 3_600_000)
     htf = _bars(30, 14_400_000)
     split = time_split(entry, htf, oos_fraction=0.30)
     assert split.in_sample[-1].timestamp < split.out_of_sample[0].timestamp
     assert all(c.timestamp < split.cutoff_timestamp for c in split.in_sample)
     assert all(c.timestamp >= split.cutoff_timestamp for c in split.out_of_sample)
-    assert all(c.timestamp < split.cutoff_timestamp for c in split.in_sample_htf)
-    assert all(c.timestamp >= split.cutoff_timestamp for c in split.out_of_sample_htf)
+
+
+def test_time_split_keeps_full_htf_history_for_oos_warmup():
+    entry = _bars(100, 3_600_000)
+    htf = _bars(30, 14_400_000)
+    split = time_split(entry, htf, oos_fraction=0.30)
+    assert split.in_sample_htf
+    assert split.out_of_sample_htf == tuple(htf)
+    assert split.out_of_sample_htf[0].timestamp < split.cutoff_timestamp
 
 
 def test_time_split_rejects_invalid_fraction():
@@ -61,4 +68,4 @@ def test_validation_returns_independent_results():
     assert result.out_of_sample_result.initial_equity == cfg.initial_capital
     assert result.in_sample_performance.total_trades >= 0
     assert result.out_of_sample_performance.total_trades >= 0
-    assert not (result.split.in_sample[-1].timestamp >= result.split.out_of_sample[0].timestamp)
+    assert result.split.out_of_sample_htf[0].timestamp < result.split.cutoff_timestamp

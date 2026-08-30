@@ -1,16 +1,4 @@
-"""Order Block detection.
-
-An Order Block is the last candle opposing the direction of the subsequent
-impulse:
-
-* Bullish OB: last *bearish* candle before the bullish displacement / MSS
-* Bearish OB: last *bullish* candle before the bearish displacement / MSS
-
-Requirements (per spec): the block must be *fresh* (price has not yet invalidated
-it), must have *caused* the structure break (MSS confirmed), and must show an
-institutional reaction (the displacement that follows). Respecting ``mss_index``
-guarantees we only use candles that already occurred.
-"""
+"""Validated Order Block detection for the Smart Money strategy."""
 from __future__ import annotations
 
 from typing import List, Optional
@@ -18,22 +6,40 @@ from typing import List, Optional
 from models.candle import Candle
 from models.setup import OrderBlock
 
+MAX_OB_LOOKBACK = 12
+
 
 def _last_opposing_candle(candles: List[Candle], mss_index: int, want_bearish: bool) -> Optional[int]:
-    """Index of the last opposing candle before ``mss_index``."""
-    for i in range(mss_index - 1, -1, -1):
+    """Find a recent opposing candle that plausibly initiated the MSS leg.
+
+    A distant opposing candle is not accepted merely because it is the last one
+    of its color. The candidate must be close to the MSS and be followed by a
+    directional reaction before the MSS candle.
+    """
+    start = max(0, mss_index - MAX_OB_LOOKBACK)
+    for i in range(mss_index - 1, start - 1, -1):
         c = candles[i]
-        if want_bearish and c.is_bearish:
-            return i
-        if (not want_bearish) and c.is_bullish:
+        if want_bearish and not c.is_bearish:
+            continue
+        if not want_bearish and not c.is_bullish:
+            continue
+
+        reaction_found = False
+        for j in range(i + 1, mss_index + 1):
+            r = candles[j]
+            if want_bearish and r.close > c.high:
+                reaction_found = True
+                break
+            if not want_bearish and r.close < c.low:
+                reaction_found = True
+                break
+        if reaction_found:
             return i
     return None
 
 
-def detect_order_block(
-    candles: List[Candle], mss_index: int, direction: str, timeframe: str = ""
-) -> Optional[OrderBlock]:
-    """Detect the order block that preceded the MSS in ``direction``."""
+def detect_order_block(candles: List[Candle], mss_index: int, direction: str, timeframe: str = "") -> Optional[OrderBlock]:
+    """Detect a recent, fresh and structure-relevant Order Block before MSS."""
     if mss_index < 1 or mss_index >= len(candles):
         return None
 
@@ -43,47 +49,47 @@ def detect_order_block(
         return None
 
     ob_candle = candles[idx]
-    if direction == "BULLISH":
-        ob = OrderBlock(
-            ob_type="BULLISH",
-            zone_high=ob_candle.high,
-            zone_low=ob_candle.low,
-            creation_index=idx,
-            timeframe=timeframe,
-            fresh=True,
-            validated=True,
-        )
-    else:
-        ob = OrderBlock(
-            ob_type="BEARISH",
-            zone_high=ob_candle.high,
-            zone_low=ob_candle.low,
-            creation_index=idx,
-            timeframe=timeframe,
-            fresh=True,
-            validated=True,
-        )
+    ob_type = "BULLISH" if direction == "BULLISH" else "BEARISH"
+    ob = OrderBlock(
+        ob_type=ob_type,
+        zone_high=ob_candle.high,
+        zone_low=ob_candle.low,
+        creation_index=idx,
+        timeframe=timeframe,
+        fresh=True,
+        validated=True,
+    )
     ob.fresh = _is_fresh(candles, ob, mss_index)
+    ob.validated = ob.fresh and _has_directional_break(candles, ob, idx, mss_index)
+    if not ob.fresh or not ob.validated:
+        return None
     return ob
 
 
-def _is_fresh(candles: List[Candle], ob: OrderBlock, mss_index: int) -> bool:
-    """An order block is fresh if price has not invalidated it after creation."""
-    start = ob.creation_index + 1
-    for j in range(start, len(candles)):
+def _has_directional_break(candles: List[Candle], ob: OrderBlock, start: int, mss_index: int) -> bool:
+    """Require price to leave the OB decisively before the MSS is confirmed."""
+    for j in range(start + 1, mss_index + 1):
         c = candles[j]
-        if ob.ob_type == "BULLISH":
-            # Invalidated if price closes below the block low.
-            if c.close < ob.zone_low:
-                return False
-        else:
-            if c.close > ob.zone_high:
-                return False
+        if ob.ob_type == "BULLISH" and c.close > ob.zone_high:
+            return True
+        if ob.ob_type == "BEARISH" and c.close < ob.zone_low:
+            return True
+    return False
+
+
+def _is_fresh(candles: List[Candle], ob: OrderBlock, mss_index: int) -> bool:
+    """An OB is fresh when no post-creation candle closes through its invalidation edge."""
+    for j in range(ob.creation_index + 1, mss_index + 1):
+        c = candles[j]
+        if ob.ob_type == "BULLISH" and c.close < ob.zone_low:
+            return False
+        if ob.ob_type == "BEARISH" and c.close > ob.zone_high:
+            return False
     return True
 
 
 def fvg_near_ob(fvg_lower: float, fvg_upper: float, ob: OrderBlock, tol: float = 0.0) -> bool:
-    """Return True when an FVG overlaps the order block zone."""
+    """Return True when an FVG overlaps or touches the order-block zone."""
     if ob is None:
         return False
-    return not (fvg_upper < ob.zone_low or fvg_lower > ob.zone_high)
+    return not (fvg_upper < ob.zone_low - tol or fvg_lower > ob.zone_high + tol)

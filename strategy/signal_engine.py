@@ -1,22 +1,4 @@
-"""Smart Money Signal Engine.
-
-This is the orchestration layer of the strategy. It is intentionally free of any
-UI, web, or persistence concerns: it consumes a :class:`CandleManager` and emits
-a structured :class:`Signal` (or a ``NONE`` signal when no valid setup exists).
-
-Pipeline (all chronological, no look-ahead):
-
-1. HTF bias from Daily + 4H market structure.
-2. Liquidity detection on the entry timeframe (up to the MSS candle).
-3. MSS detection (requires sweep + displacement + structure break).
-4. FVG detection/ scoring around the MSS.
-5. Order Block detection preceding the MSS.
-6. Premium / Discount classification of the planned entry.
-7. Entry, Stop Loss and Take-Profit (liquidity-based) computation.
-8. Risk/Reward validation (>= configured minimum).
-9. Smart Money Confidence Score.
-10. Signal emission only when every gate passes.
-"""
+"""Smart Money Signal Engine."""
 from __future__ import annotations
 
 from typing import List, Optional, Tuple
@@ -24,25 +6,15 @@ from typing import List, Optional, Tuple
 from config import Config
 from data.candle_manager import CandleManager
 from models.candle import Candle
-from models.setup import (
-    Bias,
-    Direction,
-    FVG,
-    LiquidityLevel,
-    OrderBlock,
-    Setup,
-    ZoneType,
-)
+from models.setup import Bias, Direction, FVG, LiquidityLevel, OrderBlock, Setup, ZoneType
 from models.signal import Confidence, Signal
 from strategy.displacement import detect_displacement
-from strategy.fair_value_gap import FvgContext, find_relevant_fvg
+from strategy.fair_value_gap import FvgContext, find_relevant_fvg, score_fvg
 from strategy.liquidity import best_liquidity, detect_liquidity
-from strategy.liquidity_sweep import detect_sweep_before
-from strategy.market_structure import analyze_structure
 from strategy.mss import detect_mss
 from strategy.order_block import detect_order_block, fvg_near_ob
 from strategy.premium_discount import classify_zone, compute_equilibrium
-from strategy.smart_money_score import MAX_SCORE, confidence_from_score, score_setup
+from strategy.smart_money_score import confidence_from_score, score_setup
 from strategy.swing_detection import get_structural_swings
 from utils.logger import get_logger
 
@@ -55,79 +27,60 @@ class SignalEngine:
         self.atr_period = 14
         self.vol_period = 20
         self.mss_lookback = 8
-        self.scan_window = 40  # candles scanned for the latest MSS
+        self.scan_window = 40
 
-    # ------------------------------------------------------------------ #
-    # Public entry point
-    # ------------------------------------------------------------------ #
-    def analyze(
-        self,
-        manager: CandleManager,
-        symbol: str,
-        entry_tf: Optional[str] = None,
-    ) -> Signal:
+    def analyze(self, manager: CandleManager, symbol: str, entry_tf: Optional[str] = None) -> Signal:
         entry_tf = entry_tf or self.config.default_timeframe
         return self._build_signal(manager, symbol, entry_tf)
 
-    # ------------------------------------------------------------------ #
-    # 1. HTF bias
-    # ------------------------------------------------------------------ #
     def _htf_bias(self, manager: CandleManager) -> Tuple[Bias, dict]:
-        htf = self.config.htf_timeframes  # ["1D", "4H"]
         trends = {}
-        for tf in htf:
+        for tf in self.config.htf_timeframes:
             candles = manager.get(tf)
             if len(candles) < 10:
                 trends[tf] = "NEUTRAL"
                 continue
             highs, lows = get_structural_swings(candles, index=len(candles) - 1)
-            # Use last two swing highs/lows for trend.
-            if len(highs) >= 2 and len(lows) >= 2:
-                hh = highs[-1].price > highs[-2].price
-                hl = lows[-1].price > lows[-2].price
-                lh = highs[-1].price < highs[-2].price
-                ll = lows[-1].price < lows[-2].price
-                if hh and hl:
-                    trends[tf] = "BULLISH"
-                elif lh and ll:
-                    trends[tf] = "BEARISH"
-                else:
-                    trends[tf] = "NEUTRAL"
-            else:
+            if len(highs) < 2 or len(lows) < 2:
                 trends[tf] = "NEUTRAL"
+                continue
+            hh = highs[-1].price > highs[-2].price
+            hl = lows[-1].price > lows[-2].price
+            lh = highs[-1].price < highs[-2].price
+            ll = lows[-1].price < lows[-2].price
+            trends[tf] = "BULLISH" if hh and hl else "BEARISH" if lh and ll else "NEUTRAL"
 
-        vals = list(trends.values())
-        if all(v == "BULLISH" for v in vals):
+        values = list(trends.values())
+        if values and all(v == "BULLISH" for v in values):
             return Bias.LONG_BIAS, trends
-        if all(v == "BEARISH" for v in vals):
+        if values and all(v == "BEARISH" for v in values):
             return Bias.SHORT_BIAS, trends
         return Bias.NO_BIAS, trends
 
-    # ------------------------------------------------------------------ #
-    # 2-9. Core analysis
-    # ------------------------------------------------------------------ #
-    def _analyze_setup(
-        self, manager: CandleManager, symbol: str, entry_tf: str, bias: Bias
-    ) -> Optional[Setup]:
+    def _dealing_range(self, candles: List[Candle], index: int) -> Optional[Tuple[float, float]]:
+        """Use the latest confirmed external swing pair, not all-time extremes."""
+        highs, lows = get_structural_swings(candles, index=index, left=2, right=2)
+        if not highs or not lows:
+            return None
+        high = highs[-1]
+        low = lows[-1]
+        if high.price <= low.price:
+            return None
+        return low.price, high.price
+
+    def _analyze_setup(self, manager: CandleManager, symbol: str, entry_tf: str, bias: Bias) -> Optional[Setup]:
         candles = manager.get(entry_tf)
         if len(candles) < max(self.atr_period, self.vol_period) + 5:
-            logger.debug("%s/%s: insufficient candles for analysis", symbol, entry_tf)
             return None
-
-        if bias == Bias.LONG_BIAS:
-            direction = "BULLISH"
-        elif bias == Bias.SHORT_BIAS:
-            direction = "BEARISH"
-        else:
-            return None  # Do not force a bias.
+        direction = "BULLISH" if bias == Bias.LONG_BIAS else "BEARISH" if bias == Bias.SHORT_BIAS else None
+        if direction is None:
+            return None
 
         end = len(candles) - 1
         start = max(self.vol_period, end - self.scan_window)
-
-        # Scan backward for the most recent confirmed MSS in the direction.
         mss = None
         for i in range(end, start - 1, -1):
-            res = detect_mss(
+            result = detect_mss(
                 candles,
                 index=i,
                 levels=detect_liquidity(candles, index=i, timeframe=entry_tf),
@@ -135,8 +88,8 @@ class SignalEngine:
                 vol_period=self.vol_period,
                 max_gap=self.mss_lookback,
             )
-            if res.confirmed and res.direction == direction:
-                mss = res
+            if result.confirmed and result.direction == direction:
+                mss = result
                 break
         if mss is None or mss.index is None:
             return None
@@ -144,11 +97,10 @@ class SignalEngine:
         mss_index = mss.index
         trade_dir = Direction.LONG if direction == "BULLISH" else Direction.SHORT
         setup = Setup(symbol=symbol, direction=trade_dir, bias=bias)
-
-        # Liquidity known up to the MSS candle.
         levels = detect_liquidity(candles, index=mss_index, timeframe=entry_tf)
+        target_side = "BUY-SIDE" if direction == "BULLISH" else "SELL-SIDE"
         setup.liquidity_levels = levels
-        setup.best_liquidity = best_liquidity(levels)
+        setup.best_liquidity = best_liquidity(levels, side=target_side)
         setup.sweep_confirmed = mss.sweep_index is not None
         setup.sweep_index = mss.sweep_index
         setup.displacement_confirmed = mss.displacement_index is not None
@@ -156,35 +108,33 @@ class SignalEngine:
         setup.mss_confirmed = True
         setup.mss_index = mss_index
 
-        # FVG + OB
-        disp = detect_displacement(
-            candles, index=mss_index, atr_period=self.atr_period, vol_period=self.vol_period
-        )
+        disp = detect_displacement(candles, index=mss_index, atr_period=self.atr_period, vol_period=self.vol_period)
         ctx = FvgContext(
             mss_confirmed=True,
             displacement_strong=(disp.volume_ratio or 0.0) > 1.5,
+            near_order_block=False,
+            htf_aligned=bias != Bias.NO_BIAS,
         )
         ob = detect_order_block(candles, mss_index, direction, timeframe=entry_tf)
         setup.order_block = ob
-        if ob is not None:
-            ctx.near_order_block = True
-        ctx.htf_aligned = bias != Bias.NO_BIAS
+        fvg = find_relevant_fvg(candles, mss_index, direction, ctx, timeframe=entry_tf)
+        if fvg is None or ob is None:
+            return None
 
-        fvg = find_relevant_fvg(
-            candles, mss_index, direction, ctx, timeframe=entry_tf
-        )
+        overlap = fvg_near_ob(fvg.lower, fvg.upper, ob)
+        if not overlap:
+            return None
+        ctx.near_order_block = True
+        score_fvg(fvg, ctx)
+        if fvg.score < 7 or fvg.mitigated:
+            return None
         setup.fvg = fvg
-        if fvg is not None and ob is not None:
-            ctx.near_order_block = fvg_near_ob(fvg.lower, fvg.upper, ob)
 
-        # Premium / Discount range from recent swings. The dealing range spans
-        # the full set of detected swing extremes (the external range price has
-        # been operating within), not just the most recent single swing.
-        highs, lows = get_structural_swings(candles, index=mss_index)
-        range_high = max((s.price for s in highs), default=candles[mss_index].high)
-        range_low = min((s.price for s in lows), default=candles[mss_index].low)
+        dealing_range = self._dealing_range(candles, mss_index)
+        if dealing_range is None:
+            return None
+        range_low, range_high = dealing_range
 
-        # Entry zone: prefer FVG + OB overlap.
         entry_zone = self._entry_zone(fvg, ob)
         if entry_zone is None:
             return None
@@ -195,113 +145,81 @@ class SignalEngine:
         setup.premium_discount_zone = zone
         setup.equilibrium = compute_equilibrium(range_high, range_low)
 
-        # Stop loss.
-        stop = self._compute_stop(candles, mss, ob, direction, entry_tf)
+        stop = self._compute_stop(candles, mss, ob, direction)
         if stop is None:
             return None
         setup.stop_loss = stop
 
-        # Targets from liquidity.
         tp1, tp2, tp3, target_ok = self._select_targets(direction, setup.entry, levels)
         setup.tp1, setup.tp2, setup.tp3 = tp1, tp2, tp3
         setup.liquidity_target = target_ok
-
-        # Risk / Reward.
-        rr = self._risk_reward(setup.entry, setup.stop_loss, tp2 or tp1, direction)
+        rr = self._risk_reward(setup.entry, setup.stop_loss, tp2 or tp1)
         if rr is None:
             return None
         setup.risk_reward = rr
 
-        # Score.
+        pd_favorable = (
+            zone in (ZoneType.DISCOUNT, ZoneType.EQUILIBRIUM)
+            if direction == "BULLISH"
+            else zone in (ZoneType.PREMIUM, ZoneType.EQUILIBRIUM)
+        )
         flags = {
             "HTF Bias": bias != Bias.NO_BIAS,
             "Liquidity": setup.best_liquidity is not None and setup.best_liquidity.score >= 4,
             "Sweep": setup.sweep_confirmed,
             "Displacement": setup.displacement_confirmed,
             "MSS": setup.mss_confirmed,
-            "FVG": fvg is not None and fvg.score >= 7,
-            "Order Block": ob is not None and ob.fresh and ob.validated,
-            "Premium Discount": zone in (ZoneType.DISCOUNT, ZoneType.EQUILIBRIUM),
+            "FVG": fvg.score >= 7,
+            "Order Block": ob.fresh and ob.validated,
+            "Premium Discount": pd_favorable,
             "Liquidity Target": target_ok,
         }
         breakdown = score_setup(flags)
         setup.smart_money_score = breakdown.total
         setup.score_breakdown = breakdown.to_dict()
-
-        setup.entry_reason = (
-            f"FVG+OB overlap entry at {setup.entry:.2f} "
-            f"({zone.value if isinstance(zone, ZoneType) else zone})"
-        )
-
+        setup.entry_reason = f"Validated FVG+OB overlap at {setup.entry:.2f} ({zone.value})"
         setup.explanation = self._explain(setup, flags)
         setup.confirmed = (
             setup.smart_money_score >= self.config.min_smart_money_score
             and setup.risk_reward >= self.config.min_risk_reward
+            and target_ok
+            and pd_favorable
         )
         return setup
 
-    # ------------------------------------------------------------------ #
-    # Helpers
-    # ------------------------------------------------------------------ #
     def _entry_zone(self, fvg: Optional[FVG], ob: Optional[OrderBlock]) -> Optional[Tuple[float, float]]:
-        if fvg is None and ob is None:
+        if fvg is None or ob is None:
             return None
-        if fvg is not None and ob is not None:
-            lo = max(fvg.lower, ob.zone_low)
-            hi = min(fvg.upper, ob.zone_high)
-            if hi > lo:
-                return (lo, hi)
-            # No strict overlap: use the nearer of the two zones (prefer FVG).
-            return (fvg.lower, fvg.upper)
-        if fvg is not None:
-            return (fvg.lower, fvg.upper)
-        return (ob.zone_low, ob.zone_high)
+        low = max(fvg.lower, ob.zone_low)
+        high = min(fvg.upper, ob.zone_high)
+        if high <= low:
+            return None
+        return low, high
 
-    def _compute_stop(
-        self,
-        candles: List[Candle],
-        mss,
-        ob: Optional[OrderBlock],
-        direction: str,
-        timeframe: str,
-    ) -> Optional[float]:
+    def _compute_stop(self, candles: List[Candle], mss, ob: Optional[OrderBlock], direction: str) -> Optional[float]:
         from strategy.indicators import compute_atr
-
         idx = mss.index
         atr = compute_atr(candles, period=self.atr_period, index=idx)
         if atr <= 0:
             return None
         buffer = atr * self.config.atr_multiplier
-
         sweep_index = mss.sweep_index
+        if sweep_index is None:
+            return None
         if direction == "BULLISH":
-            base = candles[sweep_index].low if sweep_index is not None else None
+            base = candles[sweep_index].low
             if ob is not None:
-                base = min(base, ob.zone_low) if base is not None else ob.zone_low
-            if base is None:
-                return None
+                base = min(base, ob.zone_low)
             return base - buffer
-        else:
-            base = candles[sweep_index].high if sweep_index is not None else None
-            if ob is not None:
-                base = max(base, ob.zone_high) if base is not None else ob.zone_high
-            if base is None:
-                return None
-            return base + buffer
+        base = candles[sweep_index].high
+        if ob is not None:
+            base = max(base, ob.zone_high)
+        return base + buffer
 
-    def _select_targets(
-        self, direction: str, entry: float, levels: List[LiquidityLevel]
-    ) -> Tuple[Optional[float], Optional[float], Optional[float], bool]:
-        if direction == "BULLISH":
-            candidates = sorted(
-                [l for l in levels if l.level_type == "BUY-SIDE" and l.price > entry],
-                key=lambda x: x.price,
-            )
-        else:
-            candidates = sorted(
-                [l for l in levels if l.level_type == "SELL-SIDE" and l.price < entry],
-                key=lambda x: -x.price,
-            )
+    def _select_targets(self, direction: str, entry: float, levels: List[LiquidityLevel]):
+        side = "BUY-SIDE" if direction == "BULLISH" else "SELL-SIDE"
+        candidates = [l for l in levels if l.level_type == side and (l.price > entry if direction == "BULLISH" else l.price < entry)]
+        candidates.sort(key=lambda x: x.price, reverse=direction != "BULLISH")
         if not candidates:
             return None, None, None, False
         tp1 = candidates[0].price
@@ -309,44 +227,30 @@ class SignalEngine:
         tp3 = candidates[2].price if len(candidates) > 2 else (tp2 or tp1)
         return tp1, tp2, tp3, tp2 is not None
 
-    def _risk_reward(
-        self, entry: float, stop: float, target: Optional[float], direction: str
-    ) -> Optional[float]:
-        if target is None or entry == stop:
+    def _risk_reward(self, entry: float, stop: float, target: Optional[float]) -> Optional[float]:
+        if target is None:
             return None
         risk = abs(entry - stop)
-        if risk <= 0:
-            return None
         reward = abs(target - entry)
-        return reward / risk
+        return reward / risk if risk > 0 else None
 
     def _explain(self, setup: Setup, flags: dict) -> List[str]:
-        out: List[str] = []
-        mapping = [
+        labels = [
             ("HTF Bias", "Higher Timeframe Bias"),
-            ("Liquidity", "Tradable Liquidity Pool"),
+            ("Liquidity", "Directional Liquidity Pool"),
             ("Sweep", "Liquidity Sweep"),
             ("Displacement", "Displacement"),
-            ("MSS", "Market Structure Shift"),
+            ("MSS", "Internal Market Structure Shift"),
             ("FVG", "Fair Value Gap"),
-            ("Order Block", "Order Block"),
-            ("Premium Discount", "Premium/Discount Entry"),
-            ("Liquidity Target", "Liquidity Target"),
+            ("Order Block", "Validated Order Block"),
+            ("Premium Discount", "Directional Premium/Discount"),
+            ("Liquidity Target", "Directional Liquidity Target"),
         ]
-        for key, label in mapping:
-            mark = "OK" if flags.get(key) else "MISSING"
-            out.append(f"[{mark}] {label}")
-        return out
+        return [f"[{'OK' if flags.get(key) else 'MISSING'}] {label}" for key, label in labels]
 
-    # ------------------------------------------------------------------ #
-    # Signal assembly
-    # ------------------------------------------------------------------ #
     def _build_signal(self, manager: CandleManager, symbol: str, entry_tf: str) -> Signal:
-        bias, trends = self._htf_bias(manager)
-        setup = None
-        if bias != Bias.NO_BIAS:
-            setup = self._analyze_setup(manager, symbol, entry_tf, bias)
-
+        bias, _ = self._htf_bias(manager)
+        setup = self._analyze_setup(manager, symbol, entry_tf, bias) if bias != Bias.NO_BIAS else None
         if setup is None or not setup.confirmed:
             return Signal(
                 symbol=symbol,
@@ -361,15 +265,13 @@ class SignalEngine:
                 tp1=None,
                 tp2=None,
                 tp3=None,
-                risk_reward=0.0,
+                risk_reward=setup.risk_reward if setup else 0.0,
                 smart_money_score=setup.smart_money_score if setup else 0,
-                confidence=Confidence.LOW,
-                liquidity_target=False,
+                confidence=confidence_from_score(setup.smart_money_score if setup else 0),
+                liquidity_target=setup.liquidity_target if setup else False,
                 setup_explanation=setup.explanation if setup else ["No valid Smart Money setup detected."],
                 score_breakdown=setup.score_breakdown if setup else {},
             )
-
-        confidence = confidence_from_score(setup.smart_money_score)
         return Signal(
             symbol=symbol,
             direction=setup.direction,
@@ -385,7 +287,7 @@ class SignalEngine:
             tp3=setup.tp3,
             risk_reward=setup.risk_reward,
             smart_money_score=setup.smart_money_score,
-            confidence=confidence,
+            confidence=confidence_from_score(setup.smart_money_score),
             liquidity_target=setup.liquidity_target,
             setup_explanation=setup.explanation,
             score_breakdown=setup.score_breakdown,
@@ -393,5 +295,5 @@ class SignalEngine:
 
 
 def candles_ts(manager: CandleManager, entry_tf: str) -> float:
-    cs = manager.get(entry_tf)
-    return cs[-1].timestamp if cs else 0
+    candles = manager.get(entry_tf)
+    return candles[-1].timestamp if candles else 0

@@ -1,14 +1,4 @@
-"""Market Structure Shift (MSS) detection.
-
-Per the specification, a true MSS requires the *combination* of:
-
-* a liquidity sweep (sell-side for bullish, buy-side for bearish),
-* a displacement impulse in the same direction,
-* a break of the internal swing structure (BOS/MSS) in that direction.
-
-All three must align at (or immediately around) the MSS candle. This prevents
-labeling ordinary price wiggles as MSS.
-"""
+"""Market Structure Shift (MSS) detection."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -24,7 +14,7 @@ from strategy.market_structure import analyze_structure
 @dataclass
 class MssResult:
     confirmed: bool
-    direction: Optional[str] = None  # "BULLISH" / "BEARISH"
+    direction: Optional[str] = None
     index: Optional[int] = None
     sweep_index: Optional[int] = None
     displacement_index: Optional[int] = None
@@ -39,32 +29,45 @@ def detect_mss(
     vol_period: int = 20,
     max_gap: int = 8,
 ) -> MssResult:
-    """Detect a fully-formed MSS ending at ``index``."""
+    """Detect MSS from sweep + displacement + internal structure break.
+
+    The structure break uses a tighter 1/1 swing definition than the external
+    market-structure detector. This prevents a large historical swing from being
+    mislabeled as the internal MSS trigger.
+    """
+    if not candles:
+        return MssResult(False)
     n = len(candles)
     if index is None:
         index = n - 1
     index = min(index, n - 1)
-    if index < 1:
-        return MssResult(confirmed=False)
+    if index < max(3, atr_period):
+        return MssResult(False)
 
-    disp = detect_displacement(candles, index=index, atr_period=atr_period, vol_period=vol_period)
-    if not disp.confirmed:
-        return MssResult(confirmed=False)
+    disp = detect_displacement(
+        candles, index=index, atr_period=atr_period, vol_period=vol_period
+    )
+    if not disp.confirmed or disp.direction is None:
+        return MssResult(False)
 
     direction = disp.direction
     expected_sweep_side = "SELL-SIDE" if direction == "BULLISH" else "BUY-SIDE"
     sweep = detect_sweep_before(
         candles, index, levels or [], expected_direction=direction, max_gap=max_gap
     )
-    if not sweep.confirmed:
-        return MssResult(confirmed=False)
+    if not sweep.confirmed or sweep.level is None or sweep.level.level_type != expected_sweep_side:
+        return MssResult(False)
 
-    structure = analyze_structure(candles, index=index)
-    structure_break = (direction == "BULLISH" and structure.bos_bullish) or (
-        direction == "BEARISH" and structure.bos_bearish
+    # Internal structure uses a tighter swing model. The break must be against
+    # the local swing immediately preceding the displacement leg.
+    internal = analyze_structure(candles, index=index, left=1, right=1)
+    structure_break = (
+        direction == "BULLISH" and internal.bos_bullish
+    ) or (
+        direction == "BEARISH" and internal.bos_bearish
     )
     if not structure_break:
-        return MssResult(confirmed=False)
+        return MssResult(False)
 
     return MssResult(
         confirmed=True,

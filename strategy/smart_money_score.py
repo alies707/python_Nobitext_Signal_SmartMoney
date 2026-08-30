@@ -1,20 +1,8 @@
-"""Smart Money Confidence Score.
+"""Auditable Smart Money setup scoring.
 
-Transparent, additive scoring model (maximum 24 points). A signal is only
-generated when the total score >= 16 (configurable). The breakdown is exposed
-so every point is auditable.
-
-    HTF Bias          +2
-    Liquidity         +3
-    Sweep             +3
-    Displacement      +2
-    MSS               +3
-    FVG               +2
-    Order Block       +2
-    Premium/Discount  +2
-    Liquidity Target  +2
-    --------------------
-    TOTAL            24
+The score is a confluence score, not a probability of profit. MSS is treated as
+structure confirmation and therefore receives less weight than its component
+evidence (sweep/displacement), reducing double-counting.
 """
 from __future__ import annotations
 
@@ -23,19 +11,18 @@ from typing import Dict
 
 from models.signal import Confidence
 
-MAX_SCORE = 24
-
 _SCORE_MAP = [
     ("HTF Bias", 2),
     ("Liquidity", 3),
     ("Sweep", 3),
-    ("Displacement", 2),
-    ("MSS", 3),
-    ("FVG", 2),
-    ("Order Block", 2),
+    ("Displacement", 3),
+    ("MSS", 1),
+    ("FVG", 3),
+    ("Order Block", 3),
     ("Premium/Discount", 2),
     ("Liquidity Target", 2),
 ]
+MAX_SCORE = sum(weight for _, weight in _SCORE_MAP)
 
 
 @dataclass
@@ -48,20 +35,17 @@ class ScoreBreakdown:
 
 
 def score_setup(flags: Dict[str, bool]) -> ScoreBreakdown:
-    """Compute the Smart Money score from a dict of boolean conditions."""
+    """Compute a deterministic, auditable confluence score."""
     breakdown = ScoreBreakdown()
-    for name, value in _SCORE_MAP:
-        earned = value if flags.get(name.replace("/", " "), False) else 0
-        breakdown.points[name] = earned
+    for name, weight in _SCORE_MAP:
+        breakdown.points[name] = weight if flags.get(name.replace("/", " "), False) else 0
     breakdown.total = sum(breakdown.points.values())
     return breakdown
 
 
 def confidence_from_score(score: int) -> Confidence:
-    if score >= 21:
+    if score >= 19:
         return Confidence.HIGH
-    if score >= 18:
-        return Confidence.MEDIUM
     if score >= 16:
-        return Confidence.LOW
+        return Confidence.MEDIUM
     return Confidence.LOW

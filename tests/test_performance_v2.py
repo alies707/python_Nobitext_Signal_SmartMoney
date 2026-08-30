@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from backtest.performance_v2 import compute_performance_v2
 from backtest.trend_pullback import V2BacktestResult, V2Trade
 from strategy.trend_momentum_pullback import Direction
@@ -43,13 +45,13 @@ def test_performance_v2_calculates_core_metrics():
     assert perf.total_trades == 3
     assert perf.wins == 2
     assert perf.losses == 1
-    assert perf.win_rate_pct == 66.66666666666667
+    assert math.isclose(perf.win_rate_pct, 66.66666666666667, rel_tol=0.0, abs_tol=1e-12)
     assert perf.profit_factor == 6.0
     assert perf.total_pnl == 25.0
     assert perf.total_return_pct == 25.0
-    assert perf.average_r == 5.0 / 3.0
-    assert perf.expectancy_r == perf.average_r
-    assert perf.max_drawdown_pct == 6.0 / 110.0 * 100.0
+    assert math.isclose(perf.average_r, 5.0 / 3.0, rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(perf.expectancy_r, perf.average_r, rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(perf.max_drawdown_pct, 6.0 / 110.0 * 100.0, rel_tol=0.0, abs_tol=1e-12)
     assert perf.max_consecutive_wins == 1
     assert perf.max_consecutive_losses == 1
     assert perf.long.trades == 2

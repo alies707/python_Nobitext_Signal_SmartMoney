@@ -86,12 +86,15 @@ def main() -> int:
         print(f"OOS period         : {ts(fold.split.out_of_sample[0].timestamp)} -> {ts(fold.split.out_of_sample[-1].timestamp)}")
         _show("IN-SAMPLE", fold.in_sample_performance)
         _show("OUT-OF-SAMPLE", fold.out_of_sample_performance, fold)
-        print(f"Sample gate        : {'PASS' if fold.out_of_sample_performance.total_trades >= result.min_trades_per_fold else 'FAIL'}")
+        print(f"Sample status      : {fold.sample_status(result.min_trades_per_fold)}")
+        print(f"Performance status : {fold.performance_status(result.min_trades_per_fold)}")
         print("-" * 72)
 
     print("[ROBUSTNESS SUMMARY]")
     print(f"OOS total trades   : {result.total_oos_trades}")
     print(f"Sufficient folds    : {result.folds_with_sufficient_sample}/{len(result.folds)}")
+    print(f"Inconclusive folds  : {result.inconclusive_folds}/{len(result.folds)}")
+    print(f"Performance fails   : {result.performance_failures}/{len(result.folds)}")
     print(f"Positive OOS folds : {result.positive_oos_folds}/{len(result.folds)}")
     print(f"Median OOS PF      : {result.median_oos_profit_factor:.3f}")
     print(f"Median PF retention: {result.median_pf_retention_pct:.2f}%")
@@ -101,7 +104,7 @@ def main() -> int:
     print(f"Aggregate OOS PnL  : {result.aggregate_oos_pnl:+,.2f}")
     print(f"Aggregate OOS ret. : {result.aggregate_oos_return_pct:+.3f}%")
     print(f"Robustness verdict : {'PASS' if result.passes_preliminary_robustness else 'FAIL'}")
-    print("Note: preliminary robustness gate is a research filter, not proof of future profitability.")
+    print("Note: PASS is a research gate only and is not proof of future profitability.")
     print("=" * 72)
     return 0 if result.passes_preliminary_robustness else 1
 

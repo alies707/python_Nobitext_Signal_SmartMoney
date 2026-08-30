@@ -129,6 +129,24 @@ def test_robust_validation_frozen_parameters_are_identical():
     )
 
 
+def test_fold_reports_sample_size_and_oos_pf_retention():
+    cfg = load_config()
+    entry = _bars(1200, 3_600_000)
+    htf = _bars(400, 14_400_000)
+    result = robust_validate_v2(entry, htf, cfg, n_folds=3, oos_fraction=0.20, min_trades_per_fold=20)
+    assert all(f.out_of_sample_performance.total_trades >= 0 for f in result.folds)
+    assert all(f.oos_pf_retention_pct >= 0 for f in result.folds)
+    assert result.folds_with_sufficient_sample <= len(result.folds)
+
+
+def test_invalid_minimum_trades_per_fold_is_rejected():
+    cfg = load_config()
+    entry = _bars(1200, 3_600_000)
+    htf = _bars(400, 14_400_000)
+    with pytest.raises(ValueError, match="min_trades_per_fold must be positive"):
+        robust_validate_v2(entry, htf, cfg, n_folds=3, oos_fraction=0.20, min_trades_per_fold=0)
+
+
 def test_future_entry_changes_cannot_affect_earlier_oos_fold():
     cfg = load_config()
     entry = _bars(1200, 3_600_000)

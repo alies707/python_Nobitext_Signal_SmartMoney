@@ -93,8 +93,6 @@ class TrendPullbackBacktester:
                     open_trade = None
 
             if open_trade is None:
-                # Only HTF candles whose full OHLC is known by bar close are visible.
-                # A 4H candle opening earlier than the 15m bar may still be forming.
                 visible_htf = [
                     h for h in htf_candles
                     if h.timestamp + self._timeframe_ms("4H") <= bar.timestamp
@@ -125,7 +123,14 @@ class TrendPullbackBacktester:
                             remaining=size,
                         )
 
-            equity_curve_value = equity + (open_trade.realized_pnl if open_trade is not None else 0.0)
+            mark_price = bar.close
+            mark_to_market = 0.0
+            if open_trade is not None and open_trade.remaining > 0:
+                if open_trade.direction == Direction.LONG:
+                    mark_to_market = (mark_price - open_trade.entry) * open_trade.remaining
+                else:
+                    mark_to_market = (open_trade.entry - mark_price) * open_trade.remaining
+            equity_curve_value = equity + (open_trade.realized_pnl if open_trade else 0.0) + mark_to_market
             self._append_equity(equity_curve_value, bar.timestamp)
 
         if open_trade is not None:

@@ -1,17 +1,16 @@
 """Regime-adaptive trend + breakout + pullback strategy.
 
-This module is deliberately independent from the existing SMC signal engine.
-It provides a deterministic research baseline that can be compared against the
-older SMC implementation without silently changing the old strategy.
-
-All decisions are made from closed candles only.
+This module provides a deterministic research baseline. All trading decisions
+are made from closed candles only. The public ``diagnose`` method exposes every
+major decision gate without changing the signal-generation rules, making live
+analysis auditable instead of returning an opaque ``None``.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
 from math import isfinite
-from typing import List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 from models.candle import Candle
 
@@ -217,37 +216,103 @@ class TrendMomentumPullbackStrategy:
         htf_candles: Sequence[Candle] | None = None,
         equity: float | None = None,
     ) -> Optional[TrendPullbackSignal]:
-        if not candles:
+        diagnostics = self.diagnose(candles, htf_candles)
+        if not diagnostics["data"] or not diagnostics["htf_data"]:
             return None
+        if not diagnostics["htf_regime_ok"]:
+            return None
+        if not diagnostics["atr_filter"]:
+            return None
+        breakout = diagnostics["breakout_candidate"]
+        if breakout is None:
+            return None
+        if not diagnostics["pullback_window"]:
+            return None
+        return self._confirm_pullback(candles, diagnostics["ema"], diagnostics["atr"], breakout, diagnostics["htf_regime"], equity)
+
+    def diagnose(
+        self,
+        candles: Sequence[Candle],
+        htf_candles: Sequence[Candle] | None = None,
+    ) -> dict[str, Any]:
+        """Return an auditable snapshot of every major strategy gate.
+
+        The method mirrors ``generate`` but never places an order or mutates
+        state. It is intentionally based only on candles supplied to it.
+        """
+        result: dict[str, Any] = {
+            "data": bool(candles),
+            "htf_data": bool(htf_candles),
+            "htf_regime": "NEUTRAL",
+            "htf_regime_ok": False,
+            "atr_filter": False,
+            "atr_pct": None,
+            "breakout_candidate": None,
+            "breakout": False,
+            "pullback_window": False,
+            "pullback_confirmation": False,
+            "risk_reward": None,
+            "final_signal": False,
+            "blocking_reason": "No valid setup detected.",
+            "ema": [],
+            "atr": [],
+        }
+        if not candles or not htf_candles:
+            result["blocking_reason"] = "Required entry or higher-timeframe data is missing."
+            return result
         if any(candles[i].timestamp >= candles[i + 1].timestamp for i in range(len(candles) - 1)):
             raise ValueError("candles must be strictly increasing by timestamp")
-        htf = htf_candles if htf_candles is not None else candles
         if len(candles) < self._minimum_candles():
-            return None
-        regime = _htf_regime(htf, self.config)
-        if regime == "NEUTRAL":
-            return None
+            result["blocking_reason"] = "Insufficient entry-timeframe history."
+            return result
+
+        regime = _htf_regime(htf_candles, self.config)
+        result["htf_regime"] = regime
+        result["htf_regime_ok"] = regime != "NEUTRAL"
+        if not result["htf_regime_ok"]:
+            result["blocking_reason"] = "Higher-timeframe regime is neutral."
+            return result
 
         closes = [c.close for c in candles]
         ema = _ema(closes, self.config.execution_ema)
         atr = _atr(candles, self.config.atr_period)
+        result["ema"] = ema
+        result["atr"] = atr
         last = len(candles) - 1
         if ema[last] is None or atr[last] is None or candles[last].close <= 0:
-            return None
-        atr_now = atr[last]
-        atr_pct = atr_now / candles[last].close
-        if not self.config.min_atr_pct <= atr_pct <= self.config.max_atr_pct:
-            return None
+            result["blocking_reason"] = "Indicators are not ready."
+            return result
+
+        atr_pct = atr[last] / candles[last].close
+        result["atr_pct"] = atr_pct
+        result["atr_filter"] = self.config.min_atr_pct <= atr_pct <= self.config.max_atr_pct
+        if not result["atr_filter"]:
+            result["blocking_reason"] = "ATR volatility filter failed."
+            return result
 
         breakout = self._latest_breakout(candles, atr, regime)
+        result["breakout_candidate"] = breakout
+        result["breakout"] = breakout is not None
         if breakout is None:
-            return None
-        if last - breakout.breakout_index > self.config.pullback_window:
-            return None
-        if last <= breakout.breakout_index:
-            return None
+            result["blocking_reason"] = "No confirmed breakout in the pullback scan window."
+            return result
 
-        return self._confirm_pullback(candles, ema, atr, breakout, regime, equity)
+        result["pullback_window"] = last > breakout.breakout_index and (last - breakout.breakout_index) <= self.config.pullback_window
+        if not result["pullback_window"]:
+            result["blocking_reason"] = "The latest breakout is outside the pullback window."
+            return result
+
+        pullback = self._pullback_status(candles, ema, atr, breakout)
+        result["pullback_confirmation"] = pullback["confirmed"]
+        result["risk_reward"] = pullback["risk_reward"]
+        result["final_signal"] = pullback["confirmed"] and (pullback["risk_reward"] is not None and pullback["risk_reward"] >= self.config.min_reward_risk)
+        if result["final_signal"]:
+            result["blocking_reason"] = ""
+        elif not pullback["confirmed"]:
+            result["blocking_reason"] = pullback["reason"]
+        else:
+            result["blocking_reason"] = "Risk/reward is below the configured minimum."
+        return result
 
     def _minimum_candles(self) -> int:
         return max(
@@ -287,6 +352,53 @@ class TrendMomentumPullbackStrategy:
                         return PendingBreakout(Direction.SHORT, i, previous_low, atr[i])
         return None
 
+    def _pullback_status(
+        self,
+        candles: Sequence[Candle],
+        ema: Sequence[Optional[float]],
+        atr: Sequence[Optional[float]],
+        breakout: PendingBreakout,
+    ) -> dict[str, Any]:
+        last = len(candles) - 1
+        candle = candles[last]
+        atr_now = atr[last]
+        ema_now = ema[last]
+        if atr_now is None or ema_now is None:
+            return {"confirmed": False, "risk_reward": None, "reason": "Indicators are not ready."}
+        zone = self.config.breakout_zone_atr * atr_now
+        touched = candles[breakout.breakout_index + 1:last + 1]
+        if not touched:
+            return {"confirmed": False, "risk_reward": None, "reason": "No post-breakout pullback candle exists yet."}
+        if breakout.direction == Direction.LONG:
+            pullback_low = min(c.low for c in touched)
+            level_touched = pullback_low <= breakout.breakout_level + zone
+            resumed = candle.close > candle.open and candle.close > breakout.breakout_level
+            ema_support = candle.low <= ema_now + zone and candle.close > ema_now
+            confirmed = level_touched and (resumed or ema_support)
+            if not confirmed:
+                return {"confirmed": False, "risk_reward": None, "reason": "Pullback has not produced a bullish confirmation."}
+            stop_reference = min(_recent_swing_low(candles, breakout.breakout_index, last + 1), breakout.breakout_level)
+            stop = stop_reference - (atr_now * self.config.stop_atr_buffer)
+            risk = candle.close - stop
+            if risk <= 0:
+                return {"confirmed": False, "risk_reward": None, "reason": "Stop-loss geometry is invalid."}
+            rr = self.config.tp1_r
+        else:
+            pullback_high = max(c.high for c in touched)
+            level_touched = pullback_high >= breakout.breakout_level - zone
+            resumed = candle.close < candle.open and candle.close < breakout.breakout_level
+            ema_resistance = candle.high >= ema_now - zone and candle.close < ema_now
+            confirmed = level_touched and (resumed or ema_resistance)
+            if not confirmed:
+                return {"confirmed": False, "risk_reward": None, "reason": "Pullback has not produced a bearish confirmation."}
+            stop_reference = max(_recent_swing_high(candles, breakout.breakout_index, last + 1), breakout.breakout_level)
+            stop = stop_reference + (atr_now * self.config.stop_atr_buffer)
+            risk = stop - candle.close
+            if risk <= 0:
+                return {"confirmed": False, "risk_reward": None, "reason": "Stop-loss geometry is invalid."}
+            rr = self.config.tp1_r
+        return {"confirmed": True, "risk_reward": rr, "reason": ""}
+
     def _confirm_pullback(
         self,
         candles: Sequence[Candle],
@@ -314,10 +426,7 @@ class TrendMomentumPullbackStrategy:
             ema_support = candle.low <= ema_now + zone and candle.close > ema_now
             if not level_touched or not (resumed or ema_support):
                 return None
-            stop_reference = min(
-                _recent_swing_low(candles, breakout.breakout_index, last + 1),
-                breakout.breakout_level,
-            )
+            stop_reference = min(_recent_swing_low(candles, breakout.breakout_index, last + 1), breakout.breakout_level)
             stop = stop_reference - (atr_now * self.config.stop_atr_buffer)
             risk = candle.close - stop
             if risk <= 0:
@@ -342,10 +451,7 @@ class TrendMomentumPullbackStrategy:
             ema_resistance = candle.high >= ema_now - zone and candle.close < ema_now
             if not level_touched or not (resumed or ema_resistance):
                 return None
-            stop_reference = max(
-                _recent_swing_high(candles, breakout.breakout_index, last + 1),
-                breakout.breakout_level,
-            )
+            stop_reference = max(_recent_swing_high(candles, breakout.breakout_index, last + 1), breakout.breakout_level)
             stop = stop_reference + (atr_now * self.config.stop_atr_buffer)
             risk = stop - candle.close
             if risk <= 0:

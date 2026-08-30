@@ -42,6 +42,12 @@ def main() -> int:
     args = parser.parse_args()
     if args.limit < 250:
         raise SystemExit("--limit must be at least 250")
+    if args.folds < 2:
+        raise SystemExit("--folds must be at least 2")
+    if not 0.10 <= args.oos_fraction <= 0.30:
+        raise SystemExit("--oos-fraction must be between 10% and 30%")
+    if args.min_trades_per_fold < 1:
+        raise SystemExit("--min-trades-per-fold must be positive")
 
     cfg = load_config()
     client = NobitexClient(api_key=cfg.nobitex_api_key, api_url=cfg.nobitex_api_url)
@@ -78,6 +84,7 @@ def main() -> int:
     print(f"Min trades/fold    : {args.min_trades_per_fold}")
     print("Validation policy  : frozen parameters; expanding chronological OOS; no tuning")
     print("OOS account policy : equity is carried forward between contiguous folds")
+    print("Performance policy : sample confidence and performance outcome are evaluated independently")
     print("-" * 72)
 
     for fold in result.folds:
@@ -88,6 +95,9 @@ def main() -> int:
         _show("OUT-OF-SAMPLE", fold.out_of_sample_performance, fold)
         print(f"Sample status      : {fold.sample_status(result.min_trades_per_fold)}")
         print(f"Performance status : {fold.performance_status(result.min_trades_per_fold)}")
+        reasons = fold.performance_failure_reasons(result.min_trades_per_fold)
+        if reasons:
+            print(f"Failure reasons    : {'; '.join(reasons)}")
         print("-" * 72)
 
     print("[ROBUSTNESS SUMMARY]")

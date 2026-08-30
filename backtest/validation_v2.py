@@ -55,14 +55,18 @@ def time_split(
     is_entry = tuple(entry_candles[:split_index])
     oos_entry = tuple(entry_candles[split_index:])
     is_htf = tuple(h for h in htf_candles if h.timestamp < cutoff)
-    oos_htf = tuple(h for h in htf_candles if h.timestamp >= cutoff)
+    # OOS may legitimately consume HTF history from before the cutoff. That
+    # history is known at the OOS decision time and is required for long-EMA
+    # warmup. The backtester itself exposes only completed HTF candles at each
+    # OOS bar, preventing any future-data leakage.
+    oos_htf = tuple(htf_candles)
 
     if not is_htf or not oos_htf:
-        raise ValueError("time split does not contain HTF data on both sides")
+        raise ValueError("time split does not contain sufficient HTF data")
     if is_entry[-1].timestamp >= oos_entry[0].timestamp:
-        raise AssertionError("in-sample and out-of-sample overlap")
-    if is_htf[-1].timestamp >= oos_htf[0].timestamp:
-        raise AssertionError("HTF in-sample and out-of-sample overlap")
+        raise AssertionError("in-sample and out-of-sample entry data overlap")
+    if is_htf[-1].timestamp >= oos_htf[0].timestamp and oos_htf[0].timestamp < cutoff:
+        raise AssertionError("invalid HTF validation boundary")
 
     return ValidationSplit(cutoff, is_entry, oos_entry, is_htf, oos_htf)
 

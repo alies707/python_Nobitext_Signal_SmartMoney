@@ -110,11 +110,8 @@ def test_robust_validation_carries_oos_equity_between_folds():
     htf = _bars(400, 14_400_000)
     result = robust_validate_v2(entry, htf, cfg, n_folds=3, oos_fraction=0.20)
     for previous, current in zip(result.folds, result.folds[1:]):
-        previous_final = (
-            previous.out_of_sample_performance.initial_capital
-            + previous.out_of_sample_performance.total_pnl
-        )
-        assert current.out_of_sample_performance.initial_capital == pytest.approx(previous_final)
+        previous_final = previous.out_of_sample_result.final_equity
+        assert current.out_of_sample_result.initial_equity == pytest.approx(previous_final)
 
 
 def test_robust_validation_frozen_parameters_are_identical():

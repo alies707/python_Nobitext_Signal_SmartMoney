@@ -65,7 +65,8 @@ class TrendPullbackBacktester:
         symbol: str,
         initial_equity: float | None = None,
     ) -> V2BacktestResult:
-        equity = initial_equity if initial_equity is not None else self.config.initial_capital
+        starting_equity = initial_equity if initial_equity is not None else self.config.initial_capital
+        equity = starting_equity
         if equity <= 0:
             raise ValueError("initial_equity must be positive")
         if len(candles) < 3 or len(htf_candles) < 1:
@@ -78,20 +79,26 @@ class TrendPullbackBacktester:
         trades: List[V2Trade] = []
         open_trade: Optional[V2Trade] = None
         warmup = self.strategy._minimum_candles()
+        self._curve: List[tuple[int, float]] = []
+
         for i in range(warmup, len(candles) - 1):
             bar = candles[i]
             next_bar = candles[i + 1]
 
             if open_trade is not None:
-                self._update_trade(open_trade, bar, equity)
+                self._update_trade(open_trade, bar)
                 if open_trade.result != "OPEN":
                     equity += open_trade.realized_pnl
                     trades.append(open_trade)
                     open_trade = None
 
             if open_trade is None:
-                # HTF history available at bar i: only fully closed HTF candles.
-                visible_htf = [h for h in htf_candles if h.timestamp < bar.timestamp]
+                # Only HTF candles whose full OHLC is known by bar close are visible.
+                # A 4H candle opening earlier than the 15m bar may still be forming.
+                visible_htf = [
+                    h for h in htf_candles
+                    if h.timestamp + self._timeframe_ms("4H") <= bar.timestamp
+                ]
                 signal = self.strategy.generate(candles[: i + 1], visible_htf)
                 if signal is not None and signal.direction != Direction.NONE:
                     entry_raw = next_bar.open
@@ -128,17 +135,29 @@ class TrendPullbackBacktester:
             trades.append(open_trade)
             self._append_equity(equity, last.timestamp)
 
-        curve = getattr(self, "_curve", [])
+        curve = self._curve
         self._curve = []
-        return V2BacktestResult(initial_equity=initial_equity if initial_equity is not None else self.config.initial_capital,
-                                final_equity=equity, trades=trades, equity_curve=curve)
+        return V2BacktestResult(
+            initial_equity=starting_equity,
+            final_equity=equity,
+            trades=trades,
+            equity_curve=curve,
+        )
+
+    @staticmethod
+    def _timeframe_ms(timeframe: str) -> int:
+        tf = timeframe.strip().upper()
+        values = {"1M": 60_000, "5M": 300_000, "15M": 900_000, "1H": 3_600_000,
+                  "4H": 14_400_000, "1D": 86_400_000}
+        try:
+            return values[tf]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported timeframe: {timeframe}") from exc
 
     def _append_equity(self, value: float, timestamp: int) -> None:
-        if not hasattr(self, "_curve"):
-            self._curve = []
         self._curve.append((timestamp, value))
 
-    def _update_trade(self, trade: V2Trade, candle: Candle, equity: float) -> None:
+    def _update_trade(self, trade: V2Trade, candle: Candle) -> None:
         if trade.remaining <= 0:
             trade.result = "WIN" if trade.realized_pnl >= 0 else "LOSS"
             return
@@ -146,8 +165,8 @@ class TrendPullbackBacktester:
             if candle.low <= trade.stop_loss:
                 self._close_all(trade, trade.stop_loss, candle.timestamp, "STOP")
                 return
-            hit1 = trade.tp1 is not None and candle.high >= trade.tp1
             hit2 = trade.tp2 is not None and candle.high >= trade.tp2
+            hit1 = trade.tp1 is not None and candle.high >= trade.tp1
             if hit2:
                 self._close_all(trade, trade.tp2, candle.timestamp, "TP2")
             elif hit1:
@@ -156,8 +175,8 @@ class TrendPullbackBacktester:
             if candle.high >= trade.stop_loss:
                 self._close_all(trade, trade.stop_loss, candle.timestamp, "STOP")
                 return
-            hit1 = trade.tp1 is not None and candle.low <= trade.tp1
             hit2 = trade.tp2 is not None and candle.low <= trade.tp2
+            hit1 = trade.tp1 is not None and candle.low <= trade.tp1
             if hit2:
                 self._close_all(trade, trade.tp2, candle.timestamp, "TP2")
             elif hit1:

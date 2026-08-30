@@ -1,20 +1,4 @@
-"""Fair Value Gap (FVG) detection and scoring.
-
-A Fair Value Gap is a three-candle imbalance:
-
-* Bullish FVG: candle[i-2].high < candle[i].low  -> gap between them
-* Bearish FVG: candle[i-2].low  > candle[i].high -> gap between them
-
-Scoring (per spec)::
-    After MSS         +3
-    Strong displacement +3
-    Near Order Block   +2
-    HTF alignment      +2
-    Minimum valid FVG score: 7
-
-A detected FVG records its boundaries, creation candle, timeframe, score, status
-and whether it has been mitigated (price later traded back into the gap).
-"""
+"""Fair Value Gap detection, lifecycle tracking and scoring."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -33,28 +17,13 @@ class FvgContext:
 
 
 def detect_fvg_at(candles: List[Candle], i: int) -> Optional[FVG]:
-    """Detect an FVG whose creation completes at candle ``i``."""
     if i < 2 or i >= len(candles):
         return None
-    c1 = candles[i - 2]
-    c3 = candles[i]
+    c1, c3 = candles[i - 2], candles[i]
     if c1.high < c3.low:
-        # Bullish gap: zone between c1.high (lower) and c3.low (upper).
-        return FVG(
-            fvg_type="BULLISH",
-            lower=c1.high,
-            upper=c3.low,
-            creation_index=i,
-            timeframe="",
-        )
+        return FVG("BULLISH", c3.low, c1.high, i, "")
     if c1.low > c3.high:
-        return FVG(
-            fvg_type="BEARISH",
-            lower=c3.high,
-            upper=c1.low,
-            creation_index=i,
-            timeframe="",
-        )
+        return FVG("BEARISH", c1.low, c3.high, i, "")
     return None
 
 
@@ -74,8 +43,8 @@ def score_fvg(fvg: FVG, ctx: FvgContext) -> int:
 
 
 def is_mitigated(fvg: FVG, candles: List[Candle], from_index: int) -> bool:
-    """Return True if any candle after ``from_index`` trades into the gap."""
-    for j in range(from_index, len(candles)):
+    """A gap is mitigated when later price trades back into its zone."""
+    for j in range(max(0, from_index), len(candles)):
         c = candles[j]
         if c.low <= fvg.upper and c.high >= fvg.lower:
             return True
@@ -89,11 +58,13 @@ def find_relevant_fvg(
     ctx: FvgContext,
     window: int = 6,
     timeframe: str = "",
+    require_score: bool = True,
 ) -> Optional[FVG]:
-    """Find the best-scoring FVG near the MSS created in the setup direction.
+    """Find the best unmitigated FVG in the setup direction.
 
-    Searches within ``window`` candles after the MSS for an FVG matching the
-    direction, scores it, and rejects mitigated or sub-threshold gaps.
+    ``require_score=False`` is used by the signal engine when OB confluence is
+    not known until after the candidate FVG is selected. The candidate is then
+    rescored with the actual FVG/OB relationship.
     """
     best: Optional[FVG] = None
     start = max(2, mss_index)
@@ -111,6 +82,9 @@ def find_relevant_fvg(
         fvg.mitigated = is_mitigated(fvg, candles, i + 1)
         if fvg.mitigated:
             fvg.status = "MITIGATED"
-        if fvg.score >= 7 and (best is None or fvg.score > best.score):
+            continue
+        if require_score and fvg.score < 7:
+            continue
+        if best is None or (fvg.score, -fvg.creation_index) > (best.score, -best.creation_index):
             best = fvg
     return best

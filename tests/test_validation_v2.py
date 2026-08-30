@@ -108,8 +108,37 @@ def test_robust_validation_has_one_result_per_fold():
 
 def test_robust_validation_frozen_parameters_are_identical():
     cfg = load_config()
-    strategy_cfg = None
     entry = _bars(1200, 3_600_000)
     htf = _bars(400, 14_400_000)
-    result = robust_validate_v2(entry, htf, cfg, strategy_config=strategy_cfg, n_folds=3, oos_fraction=0.20)
+    result = robust_validate_v2(entry, htf, cfg, n_folds=3, oos_fraction=0.20)
     assert len(result.folds) == 3
+    assert all(
+        fold.split.out_of_sample_htf == tuple(htf)
+        for fold in result.folds
+    )
+
+
+def test_future_entry_changes_cannot_affect_earlier_oos_fold():
+    cfg = load_config()
+    entry = _bars(1200, 3_600_000)
+    htf = _bars(400, 14_400_000)
+    baseline = robust_validate_v2(entry, htf, cfg, n_folds=3, oos_fraction=0.20)
+
+    changed = list(entry)
+    for i in range(1000, len(changed)):
+        candle = changed[i]
+        changed[i] = Candle(
+            timestamp=candle.timestamp,
+            open=candle.open * 3.0,
+            high=candle.high * 3.0,
+            low=candle.low * 3.0,
+            close=candle.close * 3.0,
+            volume=candle.volume,
+        )
+    mutated = robust_validate_v2(changed, htf, cfg, n_folds=3, oos_fraction=0.20)
+
+    first_base = baseline.folds[0].out_of_sample_performance
+    first_mutated = mutated.folds[0].out_of_sample_performance
+    assert first_base.total_trades == first_mutated.total_trades
+    assert first_base.total_pnl == first_mutated.total_pnl
+    assert first_base.profit_factor == first_mutated.profit_factor

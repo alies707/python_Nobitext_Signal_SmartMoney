@@ -79,8 +79,6 @@ def test_backtester_hides_in_progress_htf_candle():
     strategy.generate = spy
     bt = TrendPullbackBacktester(strategy, cfg)
     entry = _bars([100 + i * 0.1 for i in range(260)], step_ms=900_000)
-    # 4H candles begin every 4 hours. At each 15m bar, the current 4H candle
-    # must remain hidden until its complete 4H duration has elapsed.
     htf = _bars([100 + i * 0.5 for i in range(100)], step_ms=14_400_000)
     bt.run(entry, htf, "TEST")
     assert observed
@@ -98,3 +96,24 @@ def test_backtester_rejects_non_chronological_htf_data():
         assert "HTF candles must be strictly increasing" in str(exc)
     else:
         raise AssertionError("non-chronological HTF candles must be rejected")
+
+
+def test_equity_curve_includes_open_trade_mark_to_market():
+    cfg = load_config()
+    strategy = TrendMomentumPullbackStrategy(StrategyConfig(
+        htf_fast_ema=5,
+        htf_slow_ema=10,
+        execution_ema=3,
+        donchian_period=3,
+        atr_period=3,
+        min_atr_pct=0.0001,
+        max_atr_pct=1.0,
+        pullback_window=3,
+        min_reward_risk=1.0,
+    ))
+    bt = TrendPullbackBacktester(strategy, cfg)
+    candles = _bars([100 + i for i in range(20)] + [121.0, 130.0, 132.0, 134.0, 136.0])
+    htf = _bars([100 + i for i in range(20)], step_ms=14_400_000)
+    result = bt.run(candles, htf, "TEST")
+    assert result.equity_curve
+    assert any(value != cfg.initial_capital for _, value in result.equity_curve)

@@ -66,12 +66,22 @@ def test_mitigation_detection():
     assert is_mitigated(fvg, data, 3)
 
 
+def test_fvg_boundary_touch_is_not_mitigation():
+    data = [
+        _c(0, 100, 101, 99, 100),
+        _c(1, 100, 102, 99, 101),
+        _c(2, 103, 104, 102, 103),  # FVG (101, 102)
+        _c(3, 103, 104, 102, 103),  # touches the lower boundary only
+    ]
+    fvg = detect_fvg_at(data, 2)
+    assert not is_mitigated(fvg, data, 3)
+
+
 def test_find_relevant_fvg_requires_direction():
     data = [
         _c(0, 100, 101, 99, 100),
         _c(1, 100, 102, 99, 101),
         _c(2, 103, 104, 102, 103),  # bullish fvg
-        _c(3, 100, 105, 99, 104),
     ]
     ctx = FvgContext(mss_confirmed=True, displacement_strong=True, htf_aligned=True)
     fvg = find_relevant_fvg(data, 2, "BULLISH", ctx, timeframe="15m")

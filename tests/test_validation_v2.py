@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from backtest.performance_v2 import PerformanceV2
+from backtest.performance_v2 import PerformanceV2, SidePerformance
 from backtest.trend_pullback import V2BacktestResult
 from backtest.validation_v2 import (
+    RobustValidation,
     ValidationFold,
     expanding_walk_forward_splits,
     robust_validate_v2,
@@ -45,20 +46,22 @@ def _performance(total_trades: int, total_pnl: float, profit_factor: float, expe
         max_drawdown_pct=0.0,
         max_consecutive_losses=0,
         max_consecutive_wins=total_trades if total_pnl > 0 else 0,
-        long=__import__("backtest.performance_v2", fromlist=["SidePerformance"]).SidePerformance(),
-        short=__import__("backtest.performance_v2", fromlist=["SidePerformance"]).SidePerformance(),
+        long=SidePerformance(),
+        short=SidePerformance(),
     )
 
 
-def _fold_with_performance(p: PerformanceV2, minimum_trades: int = 20) -> ValidationFold:
-    candles = tuple(_bars(30, 3_600_000))
-    split = time_split(candles, tuple(_bars(10, 14_400_000)), oos_fraction=0.20)
-    result = V2BacktestResult(initial_equity=100.0, final_equity=100.0 + p.total_pnl)
+def _fold_with_performance(p: PerformanceV2, fold_id: int = 1) -> ValidationFold:
+    entry = tuple(_bars(30, 3_600_000))
+    htf = tuple(_bars(10, 14_400_000))
+    split = time_split(entry, htf, oos_fraction=0.20)
+    is_result = V2BacktestResult(initial_equity=100.0, final_equity=100.0)
+    oos_result = V2BacktestResult(initial_equity=100.0, final_equity=100.0 + p.total_pnl)
     return ValidationFold(
-        fold_id=1,
+        fold_id=fold_id,
         split=split,
-        in_sample_result=result,
-        out_of_sample_result=result,
+        in_sample_result=is_result,
+        out_of_sample_result=oos_result,
         in_sample_performance=p,
         out_of_sample_performance=p,
     )
@@ -207,7 +210,7 @@ def test_performance_status_requires_sufficient_sample_before_failure():
 
 def test_sampled_losing_fold_is_performance_failure_not_inconclusive():
     losing = _performance(total_trades=20, total_pnl=-10.0, profit_factor=0.8, expectancy_r=-0.5)
-    fold = _fold_with_performance(losing, minimum_trades=20)
+    fold = _fold_with_performance(losing)
     assert fold.sample_status(20) == "PASS"
     assert fold.performance_status(20) == "FAIL"
     assert fold.performance_failure_reasons(20) == (
@@ -219,10 +222,22 @@ def test_sampled_losing_fold_is_performance_failure_not_inconclusive():
 
 def test_insufficient_sample_remains_inconclusive_even_when_losing():
     losing = _performance(total_trades=17, total_pnl=-10.0, profit_factor=0.8, expectancy_r=-0.5)
-    fold = _fold_with_performance(losing, minimum_trades=20)
+    fold = _fold_with_performance(losing)
     assert fold.sample_status(20) == "INCONCLUSIVE"
     assert fold.performance_status(20) == "INCONCLUSIVE"
     assert fold.performance_failure_reasons(20) == ()
+
+
+def test_robust_summary_counts_sampled_failures_separately_from_inconclusive_folds():
+    passing = _fold_with_performance(_performance(20, 10.0, 1.5, 0.5), fold_id=1)
+    failing = _fold_with_performance(_performance(20, -10.0, 0.8, -0.5), fold_id=2)
+    inconclusive = _fold_with_performance(_performance(17, -5.0, 0.8, -0.3), fold_id=3)
+    result = RobustValidation((passing, failing, inconclusive), min_trades_per_fold=20)
+    assert result.folds_with_sufficient_sample == 2
+    assert result.performance_failures == 1
+    assert result.inconclusive_folds == 1
+    assert result.positive_oos_folds == 1
+    assert result.passes_preliminary_robustness is False
 
 
 def test_future_entry_changes_cannot_affect_earlier_oos_fold():

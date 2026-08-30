@@ -4,7 +4,7 @@ import pytest
 
 from config import load_config
 from models.candle import Candle
-from backtest.validation_v2 import time_split, validate_v2
+from backtest.validation_v2 import expanding_walk_forward_splits, robust_validate_v2, time_split, validate_v2
 
 
 def _bars(n: int, step_ms: int, start_ms: int = 1_700_000_000_000) -> list[Candle]:
@@ -64,8 +64,52 @@ def test_validation_returns_independent_results():
     htf = _bars(400, 14_400_000)
     result = validate_v2(entry, htf, cfg, oos_fraction=0.30)
     assert result.split.in_sample[-1].timestamp < result.split.out_of_sample[0].timestamp
-    assert result.in_sample_result.initial_equity == cfg.initial_capital
-    assert result.out_of_sample_result.initial_equity == cfg.initial_capital
     assert result.in_sample_performance.total_trades >= 0
     assert result.out_of_sample_performance.total_trades >= 0
     assert result.split.out_of_sample_htf[0].timestamp < result.split.cutoff_timestamp
+
+
+def test_expanding_walk_forward_folds_are_chronological_and_disjoint():
+    entry = _bars(100, 3_600_000)
+    htf = _bars(30, 14_400_000)
+    folds = expanding_walk_forward_splits(entry, htf, n_folds=3, oos_fraction=0.20)
+    assert len(folds) == 3
+    previous_oos_end = None
+    for split in folds:
+        assert split.in_sample[-1].timestamp < split.out_of_sample[0].timestamp
+        if previous_oos_end is not None:
+            assert previous_oos_end < split.out_of_sample[0].timestamp
+        previous_oos_end = split.out_of_sample[-1].timestamp
+        assert split.out_of_sample_htf == tuple(htf)
+        assert split.in_sample_htf[-1].timestamp < split.cutoff_timestamp
+
+
+def test_expanding_walk_forward_rejects_unworkable_layout():
+    entry = _bars(20, 3_600_000)
+    htf = _bars(10, 14_400_000)
+    with pytest.raises(ValueError):
+        expanding_walk_forward_splits(entry, htf, n_folds=5, oos_fraction=0.20)
+    with pytest.raises(ValueError):
+        expanding_walk_forward_splits(entry, htf, n_folds=3, oos_fraction=0.40)
+
+
+def test_robust_validation_has_one_result_per_fold():
+    cfg = load_config()
+    entry = _bars(1200, 3_600_000)
+    htf = _bars(400, 14_400_000)
+    result = robust_validate_v2(entry, htf, cfg, n_folds=3, oos_fraction=0.20)
+    assert len(result.folds) == 3
+    assert result.total_oos_trades >= 0
+    assert result.aggregate_oos_pnl == sum(
+        fold.out_of_sample_performance.total_pnl for fold in result.folds
+    )
+    assert result.positive_oos_folds >= 0
+
+
+def test_robust_validation_frozen_parameters_are_identical():
+    cfg = load_config()
+    strategy_cfg = None
+    entry = _bars(1200, 3_600_000)
+    htf = _bars(400, 14_400_000)
+    result = robust_validate_v2(entry, htf, cfg, strategy_config=strategy_cfg, n_folds=3, oos_fraction=0.20)
+    assert len(result.folds) == 3

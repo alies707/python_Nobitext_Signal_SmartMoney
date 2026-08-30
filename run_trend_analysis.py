@@ -1,9 +1,9 @@
 """Live Nobitex market-data analyzer for Strategy V2.
 
 Fetches real OHLCV data from Nobitex and prints an auditable decision path.
-This script never places orders. It does not treat a data-quality warning as
-an execution failure, but it clearly reports the warning so research/backtest
-code can decide whether the dataset is acceptable.
+This script never places orders. It distinguishes a structural data gap from
+normal timestamp alignment differences, especially on exchange-provided daily
+candles.
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Sequence
 
 from config import load_config
+from data.candle_manager import CandleManager
 from data.historical_data import HistoricalData
 from exchange.nobitex_client import NobitexClient, to_udf_symbol
 from models.candle import Candle
@@ -44,15 +45,22 @@ def expected_interval_ms(label: str) -> int | None:
     }.get(label)
 
 
-def gap_details(label: str, candles: Sequence[Candle]) -> list[tuple[int, int, int]]:
+def structural_gap_details(label: str, candles: Sequence[Candle]) -> list[tuple[int, int, int]]:
+    """Return only gaps large enough to represent missing bars.
+
+    Small alignment differences are not treated as missing data. This matters
+    for exchange-generated higher-timeframe bars whose timestamps can be
+    anchored to a non-midnight session boundary.
+    """
     expected = expected_interval_ms(label)
     if expected is None:
         return []
     gaps: list[tuple[int, int, int]] = []
+    threshold = expected * 1.5
     for previous, current in zip(candles, candles[1:]):
         delta = current.timestamp - previous.timestamp
-        if delta != expected:
-            gaps.append((previous.timestamp, current.timestamp, delta))
+        if delta > threshold:
+            gaps.append((previous.timestamp + expected, current.timestamp, delta))
     return gaps
 
 
@@ -68,15 +76,16 @@ def print_candle_summary(label: str, candles: Sequence[Candle]) -> None:
     print(f"Last candle      : {fmt_ts(last.timestamp)}")
     print(f"Last close       : {fmt_price(last.close)}")
     print(f"Last volume      : {last.volume:,.4f}")
-    gaps = gap_details(label, candles)
-    print(f"Timestamp gaps   : {len(gaps)}")
+    gaps = structural_gap_details(label, candles)
+    print(f"Structural gaps  : {len(gaps)}")
     if gaps:
-        previous_ts, current_ts, delta = gaps[0]
         expected = expected_interval_ms(label)
+        expected_text = f"{expected / 60000:.1f} min" if expected else "N/A"
+        expected_ts, actual_ts, delta = gaps[0]
         print(
             "First gap        : "
-            f"{fmt_ts(previous_ts)} -> {fmt_ts(current_ts)} "
-            f"({delta / 60000:.1f} min; expected {expected / 60000:.1f} min)"
+            f"expected after {fmt_ts(expected_ts)} -> actual {fmt_ts(actual_ts)} "
+            f"({delta / 60000:.1f} min; expected {expected_text})"
         )
 
 
@@ -108,10 +117,7 @@ def print_diagnostics(diagnostics: dict) -> None:
     )
     atr_pct = diagnostics.get("atr_pct")
     atr_text = "N/A" if atr_pct is None else f"{atr_pct * 100:.3f}%"
-    print(
-        f"ATR filter       : {'PASS' if diagnostics['atr_filter'] else 'FAIL'} "
-        f"({atr_text})"
-    )
+    print(f"ATR filter       : {'PASS' if diagnostics['atr_filter'] else 'FAIL'} ({atr_text})")
     print(f"Breakout         : {'PASS' if diagnostics['breakout'] else 'FAIL'}")
 
     breakout = diagnostics.get("breakout_candidate")
@@ -123,10 +129,7 @@ def print_diagnostics(diagnostics: dict) -> None:
     else:
         print("Pullback window  : N/A")
 
-    print(
-        f"Pullback confirm : "
-        f"{'PASS' if diagnostics['pullback_confirmation'] else 'FAIL'}"
-    )
+    print(f"Pullback confirm : {'PASS' if diagnostics['pullback_confirmation'] else 'FAIL'}")
     rr = diagnostics.get("risk_reward")
     print(f"Risk/Reward      : {'N/A' if rr is None else f'{rr:.2f}R'}")
     print(f"Final gate       : {'PASS' if diagnostics['final_signal'] else 'FAIL'}")
@@ -200,13 +203,12 @@ def analyze(symbol: str, timeframe: str, limit: int, equity: float | None) -> in
     diagnostics = strategy.diagnose(entry, htf_candles=htf4h)
     print_diagnostics(diagnostics)
 
-    if htf1d:
-        daily_regime = _htf_regime(htf1d, strategy_config)
-        print(f"1D independent check: {daily_regime}")
-        if daily_regime != diagnostics["htf_regime"]:
-            print("HTF consistency  : WARNING (4H and 1D regimes disagree)")
-        else:
-            print("HTF consistency  : PASS (4H and 1D regimes agree)")
+    daily_regime = _htf_regime(htf1d, strategy_config) if htf1d else "NEUTRAL"
+    print(f"1D independent check: {daily_regime}")
+    if daily_regime != diagnostics["htf_regime"]:
+        print("HTF consistency  : WARNING (4H and 1D regimes disagree)")
+    else:
+        print("HTF consistency  : PASS (4H and 1D regimes agree)")
 
     print("\n[FINAL RESULT]")
     if not entry or not htf4h or not htf1d:

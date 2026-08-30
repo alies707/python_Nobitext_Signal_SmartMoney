@@ -28,10 +28,19 @@ class ValidationFold:
     in_sample_performance: PerformanceV2
     out_of_sample_performance: PerformanceV2
 
+    @property
+    def oos_pf_retention_pct(self) -> float:
+        is_pf = self.in_sample_performance.profit_factor
+        oos_pf = self.out_of_sample_performance.profit_factor
+        if is_pf in (0.0, float("inf")):
+            return 0.0
+        return oos_pf / is_pf * 100.0
+
 
 @dataclass(frozen=True)
 class RobustValidation:
     folds: tuple[ValidationFold, ...]
+    min_trades_per_fold: int = 20
 
     @property
     def total_oos_trades(self) -> int:
@@ -46,10 +55,22 @@ class RobustValidation:
         )
 
     @property
+    def folds_with_sufficient_sample(self) -> int:
+        return sum(
+            f.out_of_sample_performance.total_trades >= self.min_trades_per_fold
+            for f in self.folds
+        )
+
+    @property
     def median_oos_profit_factor(self) -> float:
         values = [f.out_of_sample_performance.profit_factor for f in self.folds]
         finite = [v for v in values if v != float("inf")]
         return median(finite) if finite else float("inf")
+
+    @property
+    def median_pf_retention_pct(self) -> float:
+        values = [f.oos_pf_retention_pct for f in self.folds]
+        return median(values) if values else 0.0
 
     @property
     def oos_initial_equity(self) -> float:
@@ -79,10 +100,12 @@ class RobustValidation:
     def passes_preliminary_robustness(self) -> bool:
         return (
             len(self.folds) >= 3
-            and self.total_oos_trades >= 20
+            and self.total_oos_trades >= self.min_trades_per_fold * len(self.folds)
+            and self.folds_with_sufficient_sample == len(self.folds)
             and self.positive_oos_folds == len(self.folds)
             and self.aggregate_oos_pnl > 0
             and self.median_oos_profit_factor > 1.05
+            and self.median_pf_retention_pct >= 50.0
         )
 
 
@@ -133,12 +156,10 @@ def expanding_walk_forward_splits(entry_candles: Sequence[Candle], htf_candles: 
             break
         is_entry = tuple(entry_candles[:train_end])
         oos_entry = tuple(entry_candles[train_end:test_end])
-        if not is_entry or not oos_entry:
-            continue
         cutoff = oos_entry[0].timestamp
         is_htf = tuple(h for h in htf_candles if h.timestamp < cutoff)
-        if not is_htf:
-            raise ValueError(f"fold {fold_id + 1} lacks HTF history before OOS")
+        if not is_entry or not oos_entry or not is_htf:
+            continue
         splits.append(ValidationSplit(cutoff, is_entry, oos_entry, is_htf, tuple(htf_candles)))
     if len(splits) != n_folds:
         raise ValueError("could not construct the requested number of OOS folds")
@@ -153,7 +174,9 @@ def validate_v2(entry_candles: Sequence[Candle], htf_candles: Sequence[Candle], 
     return ValidationFold(1, split, compute_performance_v2(is_result), compute_performance_v2(oos_result))
 
 
-def robust_validate_v2(entry_candles: Sequence[Candle], htf_candles: Sequence[Candle], config: Config, strategy_config: StrategyConfig | None = None, n_folds: int = 3, oos_fraction: float = 0.20) -> RobustValidation:
+def robust_validate_v2(entry_candles: Sequence[Candle], htf_candles: Sequence[Candle], config: Config, strategy_config: StrategyConfig | None = None, n_folds: int = 3, oos_fraction: float = 0.20, min_trades_per_fold: int = 20) -> RobustValidation:
+    if min_trades_per_fold < 1:
+        raise ValueError("min_trades_per_fold must be positive")
     splits = expanding_walk_forward_splits(entry_candles, htf_candles, n_folds, oos_fraction)
     strategy_cfg = strategy_config or StrategyConfig()
     folds: list[ValidationFold] = []
@@ -163,4 +186,4 @@ def robust_validate_v2(entry_candles: Sequence[Candle], htf_candles: Sequence[Ca
         oos_result = TrendPullbackBacktester(TrendMomentumPullbackStrategy(strategy_cfg), config).run(split.out_of_sample, split.out_of_sample_htf, "VALIDATION", initial_equity=oos_equity)
         oos_equity = oos_result.final_equity
         folds.append(ValidationFold(fold_id, split, compute_performance_v2(is_result), compute_performance_v2(oos_result)))
-    return RobustValidation(tuple(folds))
+    return RobustValidation(tuple(folds), min_trades_per_fold=min_trades_per_fold)

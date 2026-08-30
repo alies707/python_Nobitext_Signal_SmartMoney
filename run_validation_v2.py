@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from config import load_config
 from data.historical_data import HistoricalData
 from exchange.nobitex_client import NobitexClient, to_udf_symbol
-from backtest.validation_v2 import validate_v2
+from backtest.validation_v2 import robust_validate_v2
 
 
 def ts(ms: int) -> str:
@@ -30,11 +30,12 @@ def _show(label: str, p) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Walk-forward-safe preliminary validation for Strategy V2.")
+    parser = argparse.ArgumentParser(description="Robust time-series validation for Strategy V2.")
     parser.add_argument("--symbol", default="BTCIRT")
     parser.add_argument("--timeframe", default="1H", choices=["5m", "15m", "1H", "4H"])
     parser.add_argument("--limit", type=int, default=5000)
-    parser.add_argument("--oos-fraction", type=float, default=0.30)
+    parser.add_argument("--folds", type=int, default=3)
+    parser.add_argument("--oos-fraction", type=float, default=0.20)
     args = parser.parse_args()
     if args.limit < 250:
         raise SystemExit("--limit must be at least 250")
@@ -50,29 +51,47 @@ def main() -> int:
     )
     entry = manager.get(args.timeframe)
     htf = manager.get("4H")
-    result = validate_v2(entry, htf, cfg, oos_fraction=args.oos_fraction)
-    split = result.split
-    cutoff = split.cutoff_timestamp
+    if len(entry) < 250 or len(htf) < 2:
+        print(f"ERROR: insufficient data entry={len(entry)} 4H={len(htf)}")
+        return 3
+
+    result = robust_validate_v2(
+        entry,
+        htf,
+        cfg,
+        n_folds=args.folds,
+        oos_fraction=args.oos_fraction,
+    )
+
     print("=" * 72)
-    print("NOBITEX STRATEGY V2 - IN-SAMPLE / OUT-OF-SAMPLE VALIDATION")
+    print("NOBITEX STRATEGY V2 - ROBUST TIME-SERIES VALIDATION")
     print("=" * 72)
     print(f"Symbol             : {to_udf_symbol(args.symbol)}")
     print(f"Timeframe          : {args.timeframe}")
     print(f"Entry candles      : {len(entry)}")
-    print(f"OOS fraction       : {args.oos_fraction:.0%}")
-    print(f"Cutoff              : {ts(cutoff)}")
-    print(f"IS period           : {ts(split.in_sample[0].timestamp)} -> {ts(split.in_sample[-1].timestamp)}")
-    print(f"OOS period          : {ts(split.out_of_sample[0].timestamp)} -> {ts(split.out_of_sample[-1].timestamp)}")
-    print("Validation policy   : frozen parameters; chronological split; no OOS fitting")
-    print("-")
-    _show("IN-SAMPLE", result.in_sample_performance)
-    print("-")
-    _show("OUT-OF-SAMPLE", result.out_of_sample_performance)
-    print("-")
-    print(f"OOS preliminary verdict : {'PASS' if result.oos_passes_preliminary else 'FAIL'}")
-    print("Note: preliminary PASS is not proof of statistical robustness.")
+    print(f"Folds              : {len(result.folds)}")
+    print(f"OOS fraction/fold  : {args.oos_fraction:.0%}")
+    print("Validation policy   : frozen parameters; expanding chronological OOS; no tuning")
+    print("-" * 72)
+
+    for fold in result.folds:
+        print(f"[FOLD {fold.fold_id}]")
+        print(f"IS period          : {ts(fold.split.in_sample[0].timestamp)} -> {ts(fold.split.in_sample[-1].timestamp)}")
+        print(f"OOS period         : {ts(fold.split.out_of_sample[0].timestamp)} -> {ts(fold.split.out_of_sample[-1].timestamp)}")
+        _show("IN-SAMPLE", fold.in_sample_performance)
+        _show("OUT-OF-SAMPLE", fold.out_of_sample_performance)
+        print("-" * 72)
+
+    print("[ROBUSTNESS SUMMARY]")
+    print(f"OOS total trades   : {result.total_oos_trades}")
+    print(f"Positive OOS folds : {result.positive_oos_folds}/{len(result.folds)}")
+    print(f"Median OOS PF      : {result.median_oos_profit_factor:.3f}")
+    print(f"Worst OOS PF       : {result.worst_oos_profit_factor:.3f}")
+    print(f"Aggregate OOS PnL  : {result.aggregate_oos_pnl:+,.2f}")
+    print(f"Robustness verdict : {'PASS' if result.passes_preliminary_robustness else 'FAIL'}")
+    print("Note: preliminary robustness gate is a research filter, not proof of future profitability.")
     print("=" * 72)
-    return 0 if result.oos_passes_preliminary else 1
+    return 0 if result.passes_preliminary_robustness else 1
 
 
 if __name__ == "__main__":

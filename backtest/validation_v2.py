@@ -38,14 +38,41 @@ class ValidationFold:
         return oos_pf / is_pf * 100.0
 
     def sample_status(self, minimum_trades: int) -> str:
-        return "PASS" if self.out_of_sample_performance.total_trades >= minimum_trades else "INCONCLUSIVE"
+        return (
+            "PASS"
+            if self.out_of_sample_performance.total_trades >= minimum_trades
+            else "INCONCLUSIVE"
+        )
 
     def performance_status(self, minimum_trades: int) -> str:
+        """Classify performance independently from sample-size confidence.
+
+        A low-trade fold is INCONCLUSIVE because there is not enough evidence.
+        A sufficiently sampled losing fold is a genuine FAIL and must not be
+        hidden behind the sample-size label.
+        """
         if self.out_of_sample_performance.total_trades < minimum_trades:
             return "INCONCLUSIVE"
-        if self.out_of_sample_performance.total_pnl > 0 and self.out_of_sample_performance.profit_factor > 1.0:
+        if (
+            self.out_of_sample_performance.total_pnl > 0
+            and self.out_of_sample_performance.profit_factor > 1.0
+        ):
             return "PASS"
         return "FAIL"
+
+    def performance_failure_reasons(self, minimum_trades: int) -> tuple[str, ...]:
+        """Return deterministic reasons for a sampled performance failure."""
+        p = self.out_of_sample_performance
+        if p.total_trades < minimum_trades:
+            return ()
+        reasons: list[str] = []
+        if p.total_pnl <= 0:
+            reasons.append("OOS PnL <= 0")
+        if p.profit_factor <= 1.0:
+            reasons.append("OOS profit factor <= 1.0")
+        if p.expectancy_r <= 0:
+            reasons.append("OOS expectancy <= 0R")
+        return tuple(reasons)
 
 
 @dataclass(frozen=True)
@@ -60,32 +87,30 @@ class RobustValidation:
     @property
     def positive_oos_folds(self) -> int:
         return sum(
-            f.out_of_sample_performance.total_pnl > 0
-            and f.out_of_sample_performance.profit_factor > 1.0
+            f.performance_status(self.min_trades_per_fold) == "PASS"
             for f in self.folds
         )
 
     @property
     def folds_with_sufficient_sample(self) -> int:
         return sum(
-            f.out_of_sample_performance.total_trades >= self.min_trades_per_fold
+            f.sample_status(self.min_trades_per_fold) == "PASS"
             for f in self.folds
         )
 
     @property
     def performance_failures(self) -> int:
         return sum(
-            f.out_of_sample_performance.total_trades >= self.min_trades_per_fold
-            and not (
-                f.out_of_sample_performance.total_pnl > 0
-                and f.out_of_sample_performance.profit_factor > 1.0
-            )
+            f.performance_status(self.min_trades_per_fold) == "FAIL"
             for f in self.folds
         )
 
     @property
     def inconclusive_folds(self) -> int:
-        return len(self.folds) - self.folds_with_sufficient_sample
+        return sum(
+            f.performance_status(self.min_trades_per_fold) == "INCONCLUSIVE"
+            for f in self.folds
+        )
 
     @property
     def median_oos_profit_factor(self) -> float:
@@ -135,9 +160,15 @@ class RobustValidation:
 def _validate_series(entry_candles: Sequence[Candle], htf_candles: Sequence[Candle]) -> None:
     if len(entry_candles) < 20 or len(htf_candles) < 2:
         raise ValueError("insufficient candles for validation")
-    if any(entry_candles[i].timestamp >= entry_candles[i + 1].timestamp for i in range(len(entry_candles) - 1)):
+    if any(
+        entry_candles[i].timestamp >= entry_candles[i + 1].timestamp
+        for i in range(len(entry_candles) - 1)
+    ):
         raise ValueError("entry candles must be strictly increasing")
-    if any(htf_candles[i].timestamp >= htf_candles[i + 1].timestamp for i in range(len(htf_candles) - 1)):
+    if any(
+        htf_candles[i].timestamp >= htf_candles[i + 1].timestamp
+        for i in range(len(htf_candles) - 1)
+    ):
         raise ValueError("HTF candles must be strictly increasing")
 
 
@@ -149,7 +180,10 @@ def time_split(
     if not 0.10 <= oos_fraction <= 0.50:
         raise ValueError("oos_fraction must be between 0.10 and 0.50")
     _validate_series(entry_candles, htf_candles)
-    split_index = min(max(int(len(entry_candles) * (1.0 - oos_fraction)), 1), len(entry_candles) - 1)
+    split_index = min(
+        max(int(len(entry_candles) * (1.0 - oos_fraction)), 1),
+        len(entry_candles) - 1,
+    )
     cutoff = entry_candles[split_index].timestamp
     is_entry = tuple(entry_candles[:split_index])
     oos_entry = tuple(entry_candles[split_index:])
@@ -192,7 +226,15 @@ def expanding_walk_forward_splits(
         is_htf = tuple(h for h in htf_candles if h.timestamp < cutoff)
         if not is_entry or not oos_entry or not is_htf:
             continue
-        splits.append(ValidationSplit(cutoff, is_entry, oos_entry, is_htf, tuple(htf_candles)))
+        splits.append(
+            ValidationSplit(
+                cutoff_timestamp=cutoff,
+                in_sample=is_entry,
+                out_of_sample=oos_entry,
+                in_sample_htf=is_htf,
+                out_of_sample_htf=tuple(htf_candles),
+            )
+        )
     if len(splits) != n_folds:
         raise ValueError("could not construct the requested number of OOS folds")
     return tuple(splits)
@@ -204,13 +246,17 @@ def _run_split(
     strategy_cfg: StrategyConfig,
     initial_equity: float,
 ) -> ValidationFold:
-    is_result = TrendPullbackBacktester(TrendMomentumPullbackStrategy(strategy_cfg), config).run(
+    is_result = TrendPullbackBacktester(
+        TrendMomentumPullbackStrategy(strategy_cfg), config
+    ).run(
         split.in_sample,
         split.in_sample_htf,
         "VALIDATION",
         initial_equity=config.initial_capital,
     )
-    oos_result = TrendPullbackBacktester(TrendMomentumPullbackStrategy(strategy_cfg), config).run(
+    oos_result = TrendPullbackBacktester(
+        TrendMomentumPullbackStrategy(strategy_cfg), config
+    ).run(
         split.out_of_sample,
         split.out_of_sample_htf,
         "VALIDATION",
@@ -257,7 +303,9 @@ def robust_validate_v2(
 ) -> RobustValidation:
     if min_trades_per_fold < 1:
         raise ValueError("min_trades_per_fold must be positive")
-    splits = expanding_walk_forward_splits(entry_candles, htf_candles, n_folds, oos_fraction)
+    splits = expanding_walk_forward_splits(
+        entry_candles, htf_candles, n_folds, oos_fraction
+    )
     strategy_cfg = strategy_config or StrategyConfig()
     folds: list[ValidationFold] = []
     oos_equity = config.initial_capital

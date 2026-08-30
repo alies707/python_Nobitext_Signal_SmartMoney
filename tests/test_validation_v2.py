@@ -120,10 +120,7 @@ def test_robust_validation_frozen_parameters_are_identical():
     htf = _bars(400, 14_400_000)
     result = robust_validate_v2(entry, htf, cfg, n_folds=3, oos_fraction=0.20)
     assert len(result.folds) == 3
-    assert all(
-        fold.split.out_of_sample_htf == tuple(htf)
-        for fold in result.folds
-    )
+    assert all(fold.split.out_of_sample_htf == tuple(htf) for fold in result.folds)
 
 
 def test_fold_reports_sample_size_and_oos_pf_retention():
@@ -144,12 +141,34 @@ def test_invalid_minimum_trades_per_fold_is_rejected():
         robust_validate_v2(entry, htf, cfg, n_folds=3, oos_fraction=0.20, min_trades_per_fold=0)
 
 
+def test_sample_status_distinguishes_inconclusive_from_failure():
+    cfg = load_config()
+    entry = _bars(1200, 3_600_000)
+    htf = _bars(400, 14_400_000)
+    result = robust_validate_v2(entry, htf, cfg, n_folds=3, oos_fraction=0.20, min_trades_per_fold=20)
+    statuses = [fold.sample_status(result.min_trades_per_fold) for fold in result.folds]
+    assert all(status in {"PASS", "INCONCLUSIVE"} for status in statuses)
+    assert result.inconclusive_folds == sum(status == "INCONCLUSIVE" for status in statuses)
+
+
+def test_performance_status_requires_sufficient_sample_before_failure():
+    cfg = load_config()
+    entry = _bars(1200, 3_600_000)
+    htf = _bars(400, 14_400_000)
+    result = robust_validate_v2(entry, htf, cfg, n_folds=3, oos_fraction=0.20, min_trades_per_fold=20)
+    for fold in result.folds:
+        status = fold.performance_status(result.min_trades_per_fold)
+        if fold.out_of_sample_performance.total_trades < result.min_trades_per_fold:
+            assert status == "INCONCLUSIVE"
+        else:
+            assert status in {"PASS", "FAIL"}
+
+
 def test_future_entry_changes_cannot_affect_earlier_oos_fold():
     cfg = load_config()
     entry = _bars(1200, 3_600_000)
     htf = _bars(400, 14_400_000)
     baseline = robust_validate_v2(entry, htf, cfg, n_folds=3, oos_fraction=0.20)
-
     changed = list(entry)
     for i in range(1000, len(changed)):
         candle = changed[i]
@@ -162,7 +181,6 @@ def test_future_entry_changes_cannot_affect_earlier_oos_fold():
             volume=candle.volume,
         )
     mutated = robust_validate_v2(changed, htf, cfg, n_folds=3, oos_fraction=0.20)
-
     first_base = baseline.folds[0].out_of_sample_performance
     first_mutated = mutated.folds[0].out_of_sample_performance
     assert first_base.total_trades == first_mutated.total_trades

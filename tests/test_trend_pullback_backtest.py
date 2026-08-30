@@ -6,12 +6,12 @@ from strategy.trend_momentum_pullback import Direction, StrategyConfig, TrendMom
 from backtest.trend_pullback import TrendPullbackBacktester
 
 
-def _bars(values: list[float]) -> list[Candle]:
+def _bars(values: list[float], step_ms: int = 900_000, start_ms: int = 1_700_000_000_000) -> list[Candle]:
     out = []
     for i, close in enumerate(values):
         prev = values[i - 1] if i else close
         out.append(Candle(
-            timestamp=1_700_000_000_000 + i * 900_000,
+            timestamp=start_ms + i * step_ms,
             open=prev,
             high=max(prev, close) + 1,
             low=min(prev, close) - 1,
@@ -63,22 +63,38 @@ def test_backtester_conservative_ambiguity_prefers_stop():
     assert isinstance(result.trades, list)
 
 
-def test_backtester_has_no_future_htf_visibility():
+def test_backtester_hides_in_progress_htf_candle():
     cfg = load_config()
     strategy = TrendMomentumPullbackStrategy()
     original = strategy.generate
-    seen = []
+    observed = []
 
     def spy(candles, htf_candles=None, equity=None):
         now = candles[-1].timestamp
+        observed.append((now, list(htf_candles or [])))
         if htf_candles:
-            assert all(h.timestamp < now for h in htf_candles)
-            seen.append(now)
+            assert all(h.timestamp + 14_400_000 <= now for h in htf_candles)
         return original(candles, htf_candles, equity)
 
     strategy.generate = spy
     bt = TrendPullbackBacktester(strategy, cfg)
-    entry = _bars([100 + i * 0.1 for i in range(260)])
-    htf = _bars([100 + i * 0.5 for i in range(260)])
+    entry = _bars([100 + i * 0.1 for i in range(260)], step_ms=900_000)
+    # 4H candles begin every 4 hours. At each 15m bar, the current 4H candle
+    # must remain hidden until its complete 4H duration has elapsed.
+    htf = _bars([100 + i * 0.5 for i in range(100)], step_ms=14_400_000)
     bt.run(entry, htf, "TEST")
-    assert seen
+    assert observed
+
+
+def test_backtester_rejects_non_chronological_htf_data():
+    cfg = load_config()
+    strategy = TrendMomentumPullbackStrategy()
+    bt = TrendPullbackBacktester(strategy, cfg)
+    htf = _bars([100.0, 101.0, 102.0], step_ms=14_400_000)
+    htf[1], htf[2] = htf[2], htf[1]
+    try:
+        bt.run(_bars([100.0, 101.0, 102.0]), htf, "TEST")
+    except ValueError as exc:
+        assert "HTF candles must be strictly increasing" in str(exc)
+    else:
+        raise AssertionError("non-chronological HTF candles must be rejected")

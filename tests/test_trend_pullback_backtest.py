@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from config import load_config
 from models.candle import Candle
-from strategy.trend_momentum_pullback import Direction, StrategyConfig, TrendMomentumPullbackStrategy
+from strategy.trend_momentum_pullback import Direction, StrategyConfig, TrendMomentumPullbackStrategy, TrendPullbackSignal, StrategyState
 from backtest.trend_pullback import TrendPullbackBacktester
 
 
@@ -100,7 +100,7 @@ def test_backtester_rejects_non_chronological_htf_data():
 
 def test_equity_curve_includes_open_trade_mark_to_market():
     cfg = load_config()
-    strategy = TrendMomentumPullbackStrategy(StrategyConfig(
+    strategy_cfg = StrategyConfig(
         htf_fast_ema=5,
         htf_slow_ema=10,
         execution_ema=3,
@@ -110,10 +110,42 @@ def test_equity_curve_includes_open_trade_mark_to_market():
         max_atr_pct=1.0,
         pullback_window=3,
         min_reward_risk=1.0,
-    ))
+    )
+
+    class DeterministicSignalStrategy(TrendMomentumPullbackStrategy):
+        def __init__(self):
+            super().__init__(strategy_cfg)
+            self.calls = 0
+
+        def generate(self, candles, htf_candles=None, equity=None):
+            self.calls += 1
+            if self.calls != 1:
+                return None
+            close = candles[-1].close
+            stop = close - 5.0
+            risk = close - stop
+            return TrendPullbackSignal(
+                direction=Direction.LONG,
+                timestamp=candles[-1].timestamp,
+                entry=close,
+                stop_loss=stop,
+                tp1=close + 10.0,
+                tp2=close + 15.0,
+                risk_reward=2.0,
+                atr=1.0,
+                breakout_level=close,
+                regime="BULLISH",
+                state=StrategyState.ENTRY_TRIGGERED,
+                risk_fraction=self.config.risk_per_trade,
+                position_size=None,
+                explanation=["Deterministic test signal"],
+            )
+
+    strategy = DeterministicSignalStrategy()
     bt = TrendPullbackBacktester(strategy, cfg)
-    candles = _bars([100 + i for i in range(20)] + [121.0, 130.0, 132.0, 134.0, 136.0])
-    htf = _bars([100 + i for i in range(20)], step_ms=14_400_000)
+    candles = _bars([100.0 + i for i in range(20)] + [121.0, 122.0, 123.0, 124.0])
+    htf = _bars([100.0 + i for i in range(20)], step_ms=14_400_000)
     result = bt.run(candles, htf, "TEST")
-    assert result.equity_curve
+    assert result.trades
     assert any(value != cfg.initial_capital for _, value in result.equity_curve)
+    assert any(value > cfg.initial_capital for _, value in result.equity_curve)

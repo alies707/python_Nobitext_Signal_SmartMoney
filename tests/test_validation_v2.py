@@ -100,10 +100,21 @@ def test_robust_validation_has_one_result_per_fold():
     result = robust_validate_v2(entry, htf, cfg, n_folds=3, oos_fraction=0.20)
     assert len(result.folds) == 3
     assert result.total_oos_trades >= 0
-    assert result.aggregate_oos_pnl == sum(
-        fold.out_of_sample_performance.total_pnl for fold in result.folds
-    )
+    assert result.aggregate_oos_pnl == result.oos_final_equity - result.oos_initial_equity
     assert result.positive_oos_folds >= 0
+
+
+def test_robust_validation_carries_oos_equity_between_folds():
+    cfg = load_config()
+    entry = _bars(1200, 3_600_000)
+    htf = _bars(400, 14_400_000)
+    result = robust_validate_v2(entry, htf, cfg, n_folds=3, oos_fraction=0.20)
+    for previous, current in zip(result.folds, result.folds[1:]):
+        previous_final = (
+            previous.out_of_sample_performance.initial_capital
+            + previous.out_of_sample_performance.total_pnl
+        )
+        assert current.out_of_sample_performance.initial_capital == pytest.approx(previous_final)
 
 
 def test_robust_validation_frozen_parameters_are_identical():
